@@ -218,6 +218,7 @@ export interface Translations {
       apiKeys: string
       keysTools: string
       keysSettings: string
+      skills: string
       mcp: string
       archivedChats: string
       about: string
@@ -1252,6 +1253,12 @@ export interface Translations {
       contextUsage: string
       session: string
       runtimeSessionElapsed: string
+      agentFleetOn: string
+      agentFleetOff: string
+      ultraworkOn: string
+      ultraworkOff: string
+      ultraresearchOn: string
+      ultraresearchOff: string
       yoloOn: string
       yoloOff: string
       modelNone: string
@@ -1427,6 +1434,10 @@ export interface Translations {
       back: string
       skip: string
       send: string
+      sendSelected: string
+      clearSelection: string
+      multiSelectedCount: (count: number) => string
+      multiSelectChoice: (choice: string) => string
     }
     tool: {
       code: string

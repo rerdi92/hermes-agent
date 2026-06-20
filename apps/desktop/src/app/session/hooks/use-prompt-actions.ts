@@ -26,6 +26,7 @@ import {
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { applyUltraModePrefix, ultraModeSkills } from '@/lib/skill-mode-prefix'
 import { setSessionYolo } from '@/lib/yolo-session'
 import {
   $composerAttachments,
@@ -41,10 +42,13 @@ import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
+  $agentFleetActive,
   $busy,
   $connection,
   $messages,
   $sessions,
+  $ultraresearchActive,
+  $ultraworkActive,
   $yoloActive,
   setAwaitingResponse,
   setBusy,
@@ -58,8 +62,8 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
 import type {
-  ClientSessionState,
   BrowserManageResponse,
+  ClientSessionState,
   FileAttachResponse,
   HandoffFailResponse,
   HandoffRequestResponse,
@@ -699,15 +703,29 @@ export function usePromptActions({
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(sessionId)
-        const text = buildContextText(syncedAttachments)
+
+        const ultraModes = {
+          agentFleet: $agentFleetActive.get(),
+          ultraresearch: $ultraresearchActive.get(),
+          ultrawork: $ultraworkActive.get()
+        }
+        const autoSkills = ultraModeSkills(ultraModes)
+        const contextText = buildContextText(syncedAttachments)
+        const text = autoSkills.length ? contextText : applyUltraModePrefix(contextText, ultraModes)
 
         // On sleep/wake the gateway's in-memory session may have been cleared
         // while the desktop app still holds the old session ID. Detect this,
         // resume the stored session to re-register it, and retry once.
         let submitErr: unknown = null
 
+        const submitPayload = (targetSessionId: string) => ({
+          session_id: targetSessionId,
+          text,
+          ...(autoSkills.length > 0 ? { auto_skills: autoSkills } : {})
+        })
+
         try {
-          await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: sessionId, text }))
+          await withSessionBusyRetry(() => requestGateway('prompt.submit', submitPayload(sessionId)))
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
             // Re-register the session in the gateway and get a fresh live ID.
@@ -719,7 +737,7 @@ export function usePromptActions({
 
             if (recoveredId) {
               activeSessionIdRef.current = recoveredId
-              await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: recoveredId, text }))
+              await withSessionBusyRetry(() => requestGateway('prompt.submit', submitPayload(recoveredId)))
             } else {
               submitErr = firstErr
             }

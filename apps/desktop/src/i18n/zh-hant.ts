@@ -187,6 +187,7 @@ export const zhHant = defineLocale({
       apiKeys: '工具與金鑰',
       keysTools: '工具',
       keysSettings: '設定',
+      skills: '技能',
       mcp: 'MCP',
       archivedChats: '已封存聊天',
       about: '關於',
@@ -1684,6 +1685,12 @@ export const zhHant = defineLocale({
       contextUsage: '上下文使用量',
       session: '工作階段',
       runtimeSessionElapsed: '執行時工作階段已用時間',
+      agentFleetOn: 'Agent Fleet 已開啟 — 傳送時會加上 agent fleet 模式。點擊關閉。',
+      agentFleetOff: 'Agent Fleet 已關閉 — 點擊後透過 agent fleet 模式傳送。',
+      ultraworkOn: 'ULW 已開啟 — 傳送時會加上 ultrawork 模式。點擊關閉。',
+      ultraworkOff: 'ULW 已關閉 — 點擊後傳送時加上 ultrawork 模式。',
+      ultraresearchOn: 'ULR 已開啟 — 傳送時會加上 ultraresearch 模式。點擊關閉。',
+      ultraresearchOff: 'ULR 已關閉 — 點擊後傳送時加上 ultraresearch 模式。',
       yoloOn: 'YOLO 已開啟 — 自動核准危險指令。點擊關閉。Shift+點擊可全域切換。',
       yoloOff: 'YOLO 已關閉 — 點擊自動核准危險指令。Shift+點擊可全域切換。',
       modelNone: '無',
@@ -1859,7 +1866,11 @@ export const zhHant = defineLocale({
       shortcutSuffix: ' 傳送',
       back: '返回',
       skip: '略過',
-      send: '傳送'
+      send: '傳送',
+      sendSelected: '傳送所選',
+      clearSelection: '清除',
+      multiSelectedCount: count => `已選取 ${count} 項`,
+      multiSelectChoice: choice => `切換 ${choice} 的多選狀態`
     },
     tool: {
       code: '程式碼',

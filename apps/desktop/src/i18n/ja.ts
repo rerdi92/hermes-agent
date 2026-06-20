@@ -193,6 +193,7 @@ export const ja = defineLocale({
       apiKeys: 'ツールとキー',
       keysTools: 'ツール',
       keysSettings: '設定',
+      skills: 'スキル',
       mcp: 'MCP',
       archivedChats: 'アーカイブ済みチャット',
       about: '情報',
@@ -1741,6 +1742,12 @@ export const ja = defineLocale({
       contextUsage: 'コンテキスト使用状況',
       session: 'セッション',
       runtimeSessionElapsed: 'ランタイムセッション経過時間',
+      agentFleetOn: 'Agent Fleet オン — 送信時に agent fleet モードを付与します。クリックでオフにします。',
+      agentFleetOff: 'Agent Fleet オフ — クリックすると送信を agent fleet モードにします。',
+      ultraworkOn: 'ULW オン — 送信時に ultrawork モードを付与します。クリックでオフにします。',
+      ultraworkOff: 'ULW オフ — クリックすると送信時に ultrawork モードを付与します。',
+      ultraresearchOn: 'ULR オン — 送信時に ultraresearch モードを付与します。クリックでオフにします。',
+      ultraresearchOff: 'ULR オフ — クリックすると送信時に ultraresearch モードを付与します。',
       yoloOn: 'YOLO オン — 危険なコマンドを自動承認中。クリックでオフに。Shift+クリックで全体に切り替え。',
       yoloOff: 'YOLO オフ — クリックで危険なコマンドを自動承認。Shift+クリックで全体に切り替え。',
       modelNone: 'なし',
@@ -1918,7 +1925,11 @@ export const ja = defineLocale({
       shortcutSuffix: ' で送信',
       back: '戻る',
       skip: 'スキップ',
-      send: '送信'
+      send: '送信',
+      sendSelected: '選択を送信',
+      clearSelection: 'クリア',
+      multiSelectedCount: count => `${count} 件選択中`,
+      multiSelectChoice: choice => `${choice} を複数選択に切り替え`
     },
     tool: {
       code: 'コード',

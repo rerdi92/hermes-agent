@@ -86,7 +86,92 @@ export const $panesFlipped = atom(storedBoolean(PANES_FLIPPED_STORAGE_KEY, false
 export const $isSidebarResizing = atom(false)
 export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
 
-$pinnedSessionIds.subscribe(ids => persistStringArray(SIDEBAR_PINNED_STORAGE_KEY, [...ids]))
+let applyingExternalPinnedSessions = false
+let externalPinnedSessionsReady = false
+let externalPinnedSessionsUnsubscribe: (() => void) | null = null
+
+function externalPinnedSessionsBridge() {
+  if (typeof window === 'undefined') {
+    return undefined
+  }
+
+  return window.hermesDesktop?.pinnedSessions
+}
+
+function normalizePinnedSessionIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) {
+    return []
+  }
+
+  const seen = new Set<string>()
+  const out: string[] = []
+
+  for (const item of ids) {
+    const id = typeof item === 'string' ? item.trim() : ''
+
+    if (id && !seen.has(id)) {
+      seen.add(id)
+      out.push(id)
+    }
+  }
+
+  return out
+}
+
+function applyExternalPinnedSessions(ids: unknown) {
+  const next = normalizePinnedSessionIds(ids)
+
+  if (arraysEqual($pinnedSessionIds.get(), next)) {
+    return
+  }
+
+  applyingExternalPinnedSessions = true
+  try {
+    $pinnedSessionIds.set(next)
+  } finally {
+    applyingExternalPinnedSessions = false
+  }
+}
+
+export async function syncExternalPinnedSessions(): Promise<void> {
+  const bridge = externalPinnedSessionsBridge()
+
+  if (!bridge || externalPinnedSessionsUnsubscribe) {
+    return
+  }
+
+  try {
+    const snapshot = await bridge.get()
+    externalPinnedSessionsReady = true
+
+    if (snapshot?.exists) {
+      applyExternalPinnedSessions(snapshot.ids)
+    }
+
+    externalPinnedSessionsUnsubscribe = bridge.onChanged(payload => {
+      if (payload?.exists) {
+        applyExternalPinnedSessions(payload.ids)
+      }
+    })
+  } catch {
+    // External pin sync is optional. localStorage remains the fallback.
+  }
+}
+
+$pinnedSessionIds.subscribe(ids => {
+  persistStringArray(SIDEBAR_PINNED_STORAGE_KEY, [...ids])
+
+  if (applyingExternalPinnedSessions || !externalPinnedSessionsReady) {
+    return
+  }
+
+  const bridge = externalPinnedSessionsBridge()
+
+  if (bridge) {
+    void bridge.set([...ids]).catch(() => undefined)
+  }
+})
+void syncExternalPinnedSessions()
 $sidebarCronOpen.subscribe(open => persistBoolean(SIDEBAR_CRON_OPEN_STORAGE_KEY, open))
 $sidebarMessagingOpenIds.subscribe(ids => persistStringArray(SIDEBAR_MESSAGING_OPEN_STORAGE_KEY, [...ids]))
 $sidebarSessionOrderIds.subscribe(ids => persistStringArray(SIDEBAR_SESSION_ORDER_STORAGE_KEY, [...ids]))

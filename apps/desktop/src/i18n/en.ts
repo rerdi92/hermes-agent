@@ -280,6 +280,7 @@ export const en: Translations = {
       apiKeys: 'Tools & Keys',
       keysTools: 'Tools',
       keysSettings: 'Settings',
+      skills: 'Skills',
       mcp: 'MCP',
       archivedChats: 'Archived Chats',
       about: 'About',
@@ -1611,6 +1612,12 @@ export const en: Translations = {
       contextUsage: 'Context usage',
       session: 'Session',
       runtimeSessionElapsed: 'Runtime session elapsed',
+      agentFleetOn: 'Agent Fleet on — prefixes sends with agent fleet mode. Click to turn off.',
+      agentFleetOff: 'Agent Fleet off — click to route sends through agent fleet mode.',
+      ultraworkOn: 'ULW on — prefixes sends with ultrawork mode. Click to turn off.',
+      ultraworkOff: 'ULW off — click to prefix sends with ultrawork mode.',
+      ultraresearchOn: 'ULR on — prefixes sends with ultraresearch mode. Click to turn off.',
+      ultraresearchOff: 'ULR off — click to prefix sends with ultraresearch mode.',
       yoloOn: 'YOLO on — auto-approving dangerous commands. Click to turn off. Shift+click toggles it globally.',
       yoloOff: 'YOLO off — click to auto-approve dangerous commands. Shift+click toggles it globally.',
       modelNone: 'none',
@@ -1788,7 +1795,11 @@ export const en: Translations = {
       shortcutSuffix: ' to send',
       back: 'Back',
       skip: 'Skip',
-      send: 'Send'
+      send: 'Send',
+      sendSelected: 'Send selected',
+      clearSelection: 'Clear',
+      multiSelectedCount: count => `${count} selected`,
+      multiSelectChoice: choice => `Toggle ${choice} for multi-select`
     },
     tool: {
       code: 'Code',

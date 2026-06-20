@@ -2,7 +2,7 @@
 
 import { type ToolCallMessagePartProps } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type FormEvent, type KeyboardEvent, useCallback, useMemo, useRef, useState, type ComponentProps } from 'react'
+import { type ComponentProps, type FormEvent, type KeyboardEvent, useCallback, useMemo, useRef, useState } from 'react'
 
 import { ToolFallback } from '@/components/assistant-ui/tool-fallback'
 import { Button } from '@/components/ui/button'
@@ -112,7 +112,9 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [selectedChoice, setSelectedChoice] = useState<string | null>(null)
+  const [multiSelectedChoices, setMultiSelectedChoices] = useState<string[]>([])
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const hasMultiSelections = multiSelectedChoices.length > 0
 
   // Race: tool.start fires a tick before clarify.request, so request_id
   // arrives slightly after the tool block mounts. Hold the whole panel on a
@@ -151,7 +153,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
         setSubmitting(false)
       }
     },
-    [gateway, matchingRequest, ready]
+    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, ready]
   )
 
   const handleTextareaKey = useCallback(
@@ -184,6 +186,25 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
     [draft, respond]
   )
 
+  const toggleMultiChoice = useCallback((choice: string) => {
+    setSelectedChoice(null)
+    setMultiSelectedChoices(current =>
+      current.includes(choice) ? current.filter(item => item !== choice) : [...current, choice]
+    )
+  }, [])
+
+  const submitMultiChoices = useCallback(() => {
+    if (multiSelectedChoices.length === 0) {
+      return
+    }
+
+    void respond(multiSelectedChoices.join(', '))
+  }, [multiSelectedChoices, respond])
+
+  const clearMultiChoices = useCallback(() => {
+    setMultiSelectedChoices([])
+  }, [])
+
   if (loading) {
     return (
       <ClarifyShell
@@ -210,31 +231,59 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
       {!typing && hasChoices && (
         <div className="grid gap-0.5" role="group">
-          {choices.map((choice, index) => (
-            <button
-              className={cn(
-                OPTION_ROW_CLASS,
-                'text-foreground/95 hover:bg-accent/60 disabled:cursor-not-allowed disabled:opacity-55',
-                selectedChoice === choice && 'bg-accent/60'
-              )}
-              data-choice
-              disabled={submitting}
-              key={`${index}-${choice}`}
-              onClick={() => {
-                setSelectedChoice(choice)
-                void respond(choice)
-              }}
-              type="button"
-            >
-              <RadioDot selected={selectedChoice === choice} />
-              <span className="flex-1 wrap-anywhere">{choice}</span>
-              {selectedChoice === choice && <Check aria-hidden className="mt-0.5 size-4 shrink-0 text-primary" />}
-            </button>
-          ))}
+          {choices.map((choice, index) => {
+            const isSingleSelected = selectedChoice === choice
+            const isMultiSelected = multiSelectedChoices.includes(choice)
+
+            return (
+              <div
+                className={cn(
+                  OPTION_ROW_CLASS,
+                  'items-center text-foreground/95 hover:bg-accent/60',
+                  isSingleSelected && 'bg-accent/60',
+                  isMultiSelected && 'bg-primary/5'
+                )}
+                data-choice
+                key={`${index}-${choice}`}
+              >
+                <button
+                  className="flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/55 disabled:cursor-not-allowed disabled:opacity-55"
+                  disabled={submitting}
+                  onClick={() => {
+                    setMultiSelectedChoices([])
+                    setSelectedChoice(choice)
+                    void respond(choice)
+                  }}
+                  type="button"
+                >
+                  <RadioDot selected={isSingleSelected} />
+                  <span className="flex-1 wrap-anywhere">{choice}</span>
+                  {isSingleSelected && <Check aria-hidden className="mt-0.5 size-4 shrink-0 text-primary" />}
+                </button>
+                <button
+                  aria-label={copy.multiSelectChoice(choice)}
+                  aria-pressed={isMultiSelected}
+                  className={cn(
+                    'grid size-5 shrink-0 place-items-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-ring/55 disabled:cursor-not-allowed disabled:opacity-55',
+                    isMultiSelected
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-muted-foreground/35 text-muted-foreground hover:border-primary/70 hover:text-primary'
+                  )}
+                  disabled={submitting}
+                  onClick={() => toggleMultiChoice(choice)}
+                  title={copy.multiSelectChoice(choice)}
+                  type="button"
+                >
+                  {isMultiSelected && <span className="size-2 rounded-full bg-primary" />}
+                </button>
+              </div>
+            )
+          })}
           <button
             className={cn(OPTION_ROW_CLASS, 'text-muted-foreground hover:bg-accent/40 hover:text-foreground')}
             disabled={submitting}
             onClick={() => {
+              setMultiSelectedChoices([])
               setTyping(true)
               window.setTimeout(() => textareaRef.current?.focus({ preventScroll: true }), 0)
             }}
@@ -243,6 +292,20 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
             <RadioDot selected={false} />
             <span className="flex-1">{copy.other}</span>
           </button>
+        </div>
+      )}
+
+      {!typing && hasChoices && hasMultiSelections && (
+        <div className="flex items-center justify-between gap-2 rounded-md bg-accent/30 px-2 py-1.5 text-xs text-muted-foreground">
+          <span>{copy.multiSelectedCount(multiSelectedChoices.length)}</span>
+          <div className="flex items-center gap-1.5">
+            <Button disabled={submitting} onClick={clearMultiChoices} size="xs" type="button" variant="ghost">
+              {copy.clearSelection}
+            </Button>
+            <Button disabled={submitting} onClick={submitMultiChoices} size="xs" type="button">
+              {submitting ? <Loader2 className="size-3.5 animate-spin" /> : copy.sendSelected}
+            </Button>
+          </div>
         </div>
       )}
 

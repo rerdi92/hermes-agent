@@ -5,7 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, type ComposerAttachment } from '@/store/composer'
-import { $busy, $connection, $messages, $sessions, setSessions } from '@/store/session'
+import {
+  $busy,
+  $connection,
+  $messages,
+  $sessions,
+  setAgentFleetActive,
+  setSessions,
+  setUltraresearchActive,
+  setUltraworkActive
+} from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { uploadComposerAttachment, usePromptActions } from './use-prompt-actions'
@@ -331,6 +340,9 @@ describe('usePromptActions desktop slash pickers', () => {
 describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
+    setAgentFleetActive(false)
+    setUltraworkActive(false)
+    setUltraresearchActive(false)
     vi.restoreAllMocks()
   })
 
@@ -359,6 +371,39 @@ describe('usePromptActions submit / queue drain semantics', () => {
       session_id: RUNTIME_SESSION_ID,
       text: 'hello after a stop'
     })
+  })
+
+  it('sends deterministic auto_skills when FLT, ULW, and ULR statusbar modes are active without changing the visible user message', async () => {
+    setAgentFleetActive(true)
+    setUltraworkActive(true)
+    setUltraresearchActive(true)
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('compare and implement this')
+
+    expect(requestGateway).toHaveBeenCalledWith('prompt.submit', {
+      session_id: RUNTIME_SESSION_ID,
+      text: 'compare and implement this',
+      auto_skills: ['hq-agent-collaboration', 'ulw', 'ultraresearch']
+    })
+
+    const renderedText = seeds
+      .flatMap(state => (Array.isArray(state.messages) ? (state.messages as Array<{ parts?: Array<{ text?: string }> }>) : []))
+      .flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
+
+    expect(renderedText).toContain('compare and implement this')
+    expect(renderedText).not.toContain('agent fleet ulw ultraresearch compare and implement this')
   })
 
   it('a fromQueue drain sends even when busyRef is still true on the settle edge', async () => {

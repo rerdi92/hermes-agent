@@ -6094,9 +6094,65 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _auto_skills_prompt(text: Any, auto_skills: Any, task_id: str | None = None) -> Any:
+    """Expand Desktop FLT/ULW/ULR mode toggles into real skill payloads."""
+    if not isinstance(text, str):
+        return text
+    if isinstance(auto_skills, str):
+        skill_names = [auto_skills]
+    elif isinstance(auto_skills, (list, tuple)):
+        skill_names = [str(item) for item in auto_skills if str(item).strip()]
+    else:
+        skill_names = []
+
+    allowed = {"hq-agent-collaboration", "ulw", "ultrawork", "ultraresearch"}
+    ordered = []
+    seen = set()
+    for raw_name in skill_names:
+        name = raw_name.strip()
+        if name == "ultrawork":
+            name = "ulw"
+        if name not in allowed or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+
+    if not ordered:
+        return text
+
+    try:
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+        parts = []
+        for skill_name in ordered:
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                print(f"[tui_gateway] desktop auto-skill not found: {skill_name}", file=sys.stderr)
+                continue
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is auto-loaded by the '
+                "Hermes Desktop FLT/ULW/ULR mode toggles. Follow its instructions "
+                "for this turn.]"
+            )
+            parts.append(_build_skill_message(loaded_skill, skill_dir, note, session_id=task_id))
+
+        if not parts:
+            return text
+        parts.append(
+            "The user has provided the following instruction alongside the skill invocation: "
+            f"{text.strip()}"
+        )
+        return "\n\n".join(parts)
+    except Exception as exc:
+        print(f"[tui_gateway] desktop auto-skill expansion failed: {exc}", file=sys.stderr)
+        return text
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
+    auto_skills = params.get("auto_skills")
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     session, err = _sess_nowait(params, rid)
     if err:
@@ -6157,7 +6213,8 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
             return
-        _run_prompt_submit(rid, sid, session, text)
+        run_text = _auto_skills_prompt(text, auto_skills, task_id=session.get("session_key") or sid)
+        _run_prompt_submit(rid, sid, session, run_text)
 
     threading.Thread(target=run_after_agent_ready, daemon=True).start()
     return _ok(rid, {"status": "streaming"})
