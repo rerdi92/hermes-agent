@@ -23,6 +23,7 @@ import { McpSettings } from './mcp-settings'
 import { NotificationsSettings } from './notifications-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
 import { SessionsSettings } from './sessions-settings'
+import { SkillToggleSettings } from './skill-toggle-settings'
 import type { SettingsPageProps, SettingsView as SettingsViewId } from './types'
 
 const SETTINGS_VIEWS: readonly SettingsViewId[] = [
@@ -30,6 +31,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'providers',
   'gateway',
   'keys',
+  'skills',
   'mcp',
   'notifications',
   'sessions',
@@ -165,6 +167,12 @@ export function SettingsView({ gateway, onClose, onConfigSaved, onMainModelChang
             </div>
           )}
           <OverlayNavItem
+            active={activeView === 'skills'}
+            icon={Sparkles}
+            label={t.settings.nav.skills}
+            onClick={() => setActiveView('skills')}
+          />
+          <OverlayNavItem
             active={activeView === 'mcp'}
             icon={Wrench}
             label={t.settings.nav.mcp}
@@ -231,6 +239,8 @@ export function SettingsView({ gateway, onClose, onConfigSaved, onMainModelChang
             <ProvidersSettings onClose={onClose} onViewChange={setProviderView} view={providerView} />
           ) : activeView === 'keys' ? (
             <KeysSettings view={keysView} />
+          ) : activeView === 'skills' ? (
+            <SkillToggleSettings />
           ) : activeView === 'mcp' ? (
             <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} />
           ) : activeView === 'notifications' ? (

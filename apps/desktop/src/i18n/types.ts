@@ -269,6 +269,7 @@ export interface Translations {
       apiKeys: string
       keysTools: string
       keysSettings: string
+      skills: string
       mcp: string
       archivedChats: string
       about: string
@@ -1555,6 +1556,12 @@ export interface Translations {
       openContextUsage: string
       session: string
       runtimeSessionElapsed: string
+      agentFleetOn: string
+      agentFleetOff: string
+      ultraworkOn: string
+      ultraworkOff: string
+      ultraresearchOn: string
+      ultraresearchOff: string
       yoloOn: string
       yoloOff: string
       modelNone: string
