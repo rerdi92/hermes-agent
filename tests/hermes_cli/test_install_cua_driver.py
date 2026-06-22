@@ -210,3 +210,55 @@ class TestCheckCuaDriverAssetForArch:
              patch.object(tools_config, "_run_cua_driver_installer") as runner:
             assert tools_config.install_cua_driver(upgrade=True) is False
             runner.assert_not_called()
+
+
+class TestComputerUseStatusLines:
+    def test_non_macos_status_explains_platform_gate(self, monkeypatch):
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr(hermes_main.sys, "platform", "win32")
+        lines = hermes_main._computer_use_status_lines()
+
+        joined = "\n".join(lines)
+        assert "unavailable on this platform (win32)" in joined
+        assert "macOS-only" in joined
+        assert "hermes computer-use install" not in joined
+        assert "browser toolset" in joined
+
+    def test_non_macos_status_includes_safe_desktop_control_routes(self, monkeypatch):
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr(hermes_main.sys, "platform", "win32")
+        lines = hermes_main._computer_use_status_lines()
+        joined = "\n".join(lines)
+
+        assert "desktop_control safe routing:" in joined
+        assert "web UI -> browser" in joined
+        assert "local files/logs -> file_terminal" in joined
+        assert "screenshots -> vision" in joined
+        assert "native Windows GUI mutation -> unsupported" in joined
+
+    def test_macos_status_without_driver_keeps_install_hint(self, monkeypatch):
+        from hermes_cli import main as hermes_main
+
+        monkeypatch.setattr(hermes_main.sys, "platform", "darwin")
+        monkeypatch.setattr("shutil.which", lambda name: None)
+
+        assert hermes_main._computer_use_status_lines() == [
+            "cua-driver: not installed",
+            "  Run: hermes computer-use install",
+        ]
+
+    def test_macos_status_with_driver_includes_version(self, monkeypatch):
+        from hermes_cli import main as hermes_main
+
+        class _Completed:
+            stdout = "cua-driver 0.1.6\n"
+
+        monkeypatch.setattr(hermes_main.sys, "platform", "darwin")
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/cua-driver")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _Completed())
+
+        lines = hermes_main._computer_use_status_lines()
+        assert lines[0] == "cua-driver: installed at /usr/local/bin/cua-driver (cua-driver 0.1.6)"
+        assert lines[1] == "  Refresh to latest: hermes computer-use install --upgrade"

@@ -65,6 +65,92 @@ import os
 import sys
 
 
+def _safe_desktop_control_route_lines(platform_id: str) -> list[str]:
+    """Return concise desktop_control route examples for status output.
+
+    This intentionally calls the side-effect-free routing helper only; it does
+    not probe browser, file, vision, terminal, or native GUI backends.
+    """
+    try:
+        from tools.computer_use.routing import route_desktop_request
+    except Exception:
+        return []
+
+    examples = [
+        (
+            "web UI",
+            route_desktop_request(target="https://example.com", platform=platform_id),
+        ),
+        (
+            "local files/logs",
+            route_desktop_request(target="C:/Users/example/AppData/Local/hermes/logs/agent.log", platform=platform_id),
+        ),
+        (
+            "screenshots",
+            route_desktop_request(target="screenshot", platform=platform_id),
+        ),
+        (
+            "native Windows GUI mutation",
+            route_desktop_request(
+                intent="operate",
+                target="app:Settings",
+                read_only=False,
+                platform=platform_id,
+                windows_uia_readonly_available=True,
+            ),
+        ),
+    ]
+    lines = ["  desktop_control safe routing:"]
+    for label, decision in examples:
+        lines.append(f"    {label} -> {decision.route}: {decision.next_safe_action}")
+    return lines
+
+
+def _computer_use_status_lines() -> list[str]:
+    """Return user-facing `hermes computer-use status` lines.
+
+    The backend is intentionally macOS-only. On Windows/Linux, saying only
+    "cua-driver: not installed" invites users to run an installer that will
+    never make the tool available on this machine, so surface the platform
+    gate and the recommended cross-platform alternatives directly.
+    """
+    import shutil
+    import subprocess
+
+    if sys.platform != "darwin":
+        lines = [
+            f"computer_use: unavailable on this platform ({sys.platform})",
+            "  cua-driver is a macOS-only backend for background desktop control.",
+            "  Use the browser toolset for cross-platform web UI automation.",
+            "  Use terminal/file tools for local Windows/Linux tasks, or run Hermes on a Mac for computer_use.",
+        ]
+        lines.extend(_safe_desktop_control_route_lines(sys.platform))
+        return lines
+
+    path = shutil.which("cua-driver")
+    if path:
+        version = ""
+        try:
+            version = subprocess.run(
+                ["cua-driver", "--version"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            pass
+        installed = f"cua-driver: installed at {path}"
+        if version:
+            installed += f" ({version})"
+        return [
+            installed,
+            "  Refresh to latest: hermes computer-use install --upgrade",
+        ]
+
+    return [
+        "cua-driver: not installed",
+        "  Run: hermes computer-use install",
+    ]
+
+
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
     'htop' show the app name instead of 'python3.xx'.
@@ -12063,26 +12149,8 @@ def main():
             install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
             return
         if action == "status":
-            import shutil
-            import subprocess
-            path = shutil.which("cua-driver")
-            if path:
-                version = ""
-                try:
-                    version = subprocess.run(
-                        ["cua-driver", "--version"],
-                        capture_output=True, text=True, timeout=5,
-                    ).stdout.strip()
-                except Exception:
-                    pass
-                if version:
-                    print(f"cua-driver: installed at {path} ({version})")
-                else:
-                    print(f"cua-driver: installed at {path}")
-                print("  Refresh to latest: hermes computer-use install --upgrade")
-                return
-            print("cua-driver: not installed")
-            print("  Run: hermes computer-use install")
+            for line in _computer_use_status_lines():
+                print(line)
             return
         # No subcommand → show help
         computer_use_parser.print_help()

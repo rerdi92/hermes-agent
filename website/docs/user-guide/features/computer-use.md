@@ -147,11 +147,22 @@ Screenshots are expensive. Hermes applies four layers of optimisation:
 A 20-action session on a 1568×900 display typically costs ~30K tokens
 of screenshot context, not ~600K.
 
-## Limitations
+## Limitations and platform status
 
-- **macOS only.** cua-driver uses private Apple SPIs that don't exist on
-  Linux or Windows. For cross-platform GUI automation, use the `browser`
-  toolset.
+- **macOS production backend today.** The current `computer_use` runtime uses
+  cua-driver, which depends on macOS APIs that do not exist on Linux or
+  Windows. On non-macOS hosts, `hermes tools list` may show the toolset as
+  configured but unavailable at runtime; use `hermes computer-use status` for
+  the platform-specific explanation.
+- **Windows roadmap.** Windows support should start as read-only UI
+  inspection using Microsoft UI Automation: list windows/apps and capture an
+  accessibility tree. Click/type/drag support should come later, only after
+  read-only capture is reliable, approval-gated, and post-verified. See the
+  developer design note: [Desktop Control Routing](../../developer-guide/desktop-control-routing.md).
+- **Recommended Windows/Linux routes now.** Use `browser` for web UIs,
+  `terminal`/`file` for local state and config, and `vision` for user-provided
+  screenshots. Do not install cua-driver on Windows/Linux expecting native
+  desktop control.
 - **Private SPI risk.** Apple can change SkyLight's symbol surface in any
   OS update. Pin the driver version with the `HERMES_CUA_DRIVER_VERSION`
   env var if you want reproducibility across a macOS bump.
