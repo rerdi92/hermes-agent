@@ -8128,9 +8128,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
-                )
+                if getattr(_pending_clarify, "multi_select", False) and getattr(_pending_clarify, "choices", None):
+                    _resolved_reply = _raw_clarify_reply
+                    _parsed = _clarify_mod.parse_multi_select_response(
+                        _raw_clarify_reply,
+                        list(_pending_clarify.choices or []),
+                    )
+                    if _parsed:
+                        _resolved_reply = ", ".join(_parsed)
+                    _resolved = _clarify_mod.resolve_gateway_clarify(
+                        _pending_clarify.clarify_id, _resolved_reply,
+                    )
+                else:
+                    _resolved = _clarify_mod.resolve_text_response_for_session(
+                        _quick_key, _raw_clarify_reply,
+                    )
                 if _resolved:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
@@ -16615,7 +16627,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # explaining that no response arrived (so the agent can adapt
             # rather than hang forever).
             # ------------------------------------------------------------------
-            def _clarify_callback_sync(question: str, choices) -> str:
+            def _clarify_callback_sync(
+                question: str,
+                choices,
+                *,
+                multi_select: bool = False,
+                min_selections: int = 0,
+                max_selections = None,
+                allow_other: bool = True,
+            ) -> str:
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
@@ -16628,6 +16648,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key or "",
                     question=question,
                     choices=list(choices) if choices else None,
+                    multi_select=multi_select,
+                    min_selections=min_selections,
+                    max_selections=max_selections,
+                    allow_other=allow_other,
                 )
 
                 # Pause typing — like approval, we don't want a "thinking..."
@@ -16648,6 +16672,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         clarify_id=clarify_id,
                         session_key=session_key or "",
                         metadata=_status_thread_metadata,
+                        multi_select=multi_select,
+                        min_selections=min_selections,
+                        max_selections=max_selections,
+                        allow_other=allow_other,
                     ),
                     _loop_for_step,
                     logger=logger,
