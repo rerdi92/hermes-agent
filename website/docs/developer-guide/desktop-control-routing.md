@@ -24,9 +24,9 @@ The long-term shape should be a higher-level `desktop_control` abstraction that 
 
 ## External references
 
-- Microsoft UI Automation entry point: <https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32>
-- Microsoft UI Automation overview: <https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview>
-- Microsoft UI Automation tree overview: <https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-treeoverview>
+- Microsoft UI Automation entry point: [UI Automation entry point](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32)
+- Microsoft UI Automation overview: [UI Automation overview](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview)
+- Microsoft UI Automation tree overview: [UI Automation tree overview](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-treeoverview)
 
 These references establish UI Automation as the native Windows accessibility/control API and describe the UIA element tree model that a read-only backend should expose.
 
