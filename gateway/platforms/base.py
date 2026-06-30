@@ -1099,7 +1099,7 @@ def _media_delivery_strict_mode() -> bool:
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    home = _media_delivery_home()
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1149,6 +1149,19 @@ def _media_delivery_denied_paths() -> List[Path]:
     return denied
 
 
+def _media_delivery_home() -> Path:
+    """Return the live home directory used for media-delivery denylist checks.
+
+    On Windows, ``os.path.expanduser("~")`` prefers USERPROFILE over HOME.
+    Tests and containerized gateway processes often override HOME only, so read
+    HOME explicitly first and fall back to expanduser for normal desktop use.
+    """
+    raw_home = os.environ.get("HOME")
+    if raw_home:
+        return Path(raw_home)
+    return Path(os.path.expanduser("~"))
+
+
 def _path_under_denied_prefix(resolved: Path) -> bool:
     """Return True if ``resolved`` lives under a deny-listed system path.
 
@@ -1164,7 +1177,7 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = _media_delivery_home().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -3516,6 +3529,8 @@ class BasePlatformAdapter(ABC):
         for match in media_pattern.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))
             if path:
+                if "\x00" in path:
+                    continue
                 try:
                     media.append((os.path.expanduser(path), has_voice_tag))
                 except (OSError, RuntimeError, ValueError):

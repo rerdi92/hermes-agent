@@ -287,6 +287,12 @@ def _is_cron_silence_response(text: str) -> bool:
         return True
     return False
 
+
+# Backward-compatible name used by older cron tests and integrations.  Keep the
+# implementation centralized in the newer, more explicit helper above.
+def _is_silent_response(text: str) -> bool:
+    return _is_cron_silence_response(text)
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
