@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { I18nProvider } from '@/i18n'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
-import { $gateway } from '@/store/gateway'
+import { $gateway, setPrimaryGateway } from '@/store/gateway'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import { $activeSessionId } from '@/store/session'
 
@@ -32,6 +32,7 @@ function resetClarifyTestState() {
   $clarifyRequests.set({})
   $activeSessionId.set(null)
   $gateway.set(null)
+  setPrimaryGateway(null)
 }
 
 function renderClarifyTool(requestMock = vi.fn().mockResolvedValue({ ok: true }), argsOverride: Partial<TestClarifyArgs> = {}) {
@@ -238,6 +239,83 @@ describe('ClarifyTool selection status UX', () => {
 
     expect(screen.getByText('Selected')).toBeTruthy()
     expect(screen.getByText('Other (type your answer): Use only local reports')).toBeTruthy()
+  })
+  it('routes clarify responses through the request owner profile gateway', async () => {
+    const wrongGatewayRequest = vi.fn().mockResolvedValue({ ok: true })
+    const ownerGatewayRequest = vi.fn().mockResolvedValue({ ok: true })
+
+    $gateway.set({ request: wrongGatewayRequest } as never)
+    $activeSessionId.set('session-research')
+    setPrimaryGateway({ request: ownerGatewayRequest } as never, 'research')
+    setClarifyRequest({
+      requestId: 'req-profile',
+      question: 'Which context should Hermes use?',
+      choices: ['Past sessions', 'Local reports', 'Web sources'],
+      sessionId: 'session-research',
+      profile: 'research'
+    })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <ClarifyTool
+          {...({
+            args: { question: 'Which context should Hermes use?', choices: ['Past sessions', 'Local reports', 'Web sources'] },
+            result: undefined,
+            status: { type: 'running' }
+          } as unknown as Parameters<typeof ClarifyTool>[0])}
+        />
+      </I18nProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Past sessions' }))
+
+    await waitFor(() =>
+      expect(ownerGatewayRequest).toHaveBeenCalledWith(
+        'clarify.respond',
+        {
+          request_id: 'req-profile',
+          answer: 'Past sessions'
+        },
+        120_000
+      )
+    )
+    expect(wrongGatewayRequest).not.toHaveBeenCalled()
+  })
+
+  it('fails closed instead of falling back to the active gateway when the owner profile gateway is missing', async () => {
+    const wrongGatewayRequest = vi.fn().mockResolvedValue({ ok: true })
+
+    $gateway.set({ request: wrongGatewayRequest } as never)
+    $activeSessionId.set('session-research')
+    setClarifyRequest({
+      requestId: 'req-profile-missing',
+      question: 'Which context should Hermes use?',
+      choices: ['Past sessions', 'Local reports', 'Web sources'],
+      sessionId: 'session-research',
+      profile: 'research'
+    })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <ClarifyTool
+          {...({
+            args: { question: 'Which context should Hermes use?', choices: ['Past sessions', 'Local reports', 'Web sources'] },
+            result: undefined,
+            status: { type: 'running' }
+          } as unknown as Parameters<typeof ClarifyTool>[0])}
+        />
+      </I18nProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Past sessions' }))
+
+    await waitFor(() => {
+      expect($notifications.get()[0]).toMatchObject({
+        kind: 'error',
+        title: 'Could not send clarify response'
+      })
+    })
+    expect(wrongGatewayRequest).not.toHaveBeenCalled()
   })
 })
 

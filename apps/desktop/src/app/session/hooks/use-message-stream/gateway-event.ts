@@ -11,7 +11,7 @@ import { playCompletionSound } from '@/lib/completion-sound'
 import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { type ClarifyRequest, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
@@ -23,6 +23,7 @@ import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
   $currentCwd,
+  $sessions,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -40,7 +41,7 @@ import { clearSessionSubagents, pruneDelegateFallbackSubagents, upsertSubagent }
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import { notifyWorkspaceChanged, toolMayMutateFiles } from '@/store/workspace-events'
-import type { RpcEvent } from '@/types/hermes'
+import type { RpcEvent, SessionInfo } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -70,6 +71,47 @@ interface GatewayEventDeps {
     phase: 'running' | 'complete',
     sourceEventType?: string
   ) => void
+}
+
+function sessionOwnsRuntimeId(session: SessionInfo, sessionId: string): boolean {
+  return session.id === sessionId || session._lineage_root_id === sessionId
+}
+
+function profileForSession(sessionId: null | string, sessions: SessionInfo[]): null | string {
+  if (!sessionId) {
+    return null
+  }
+
+  return sessions.find(session => sessionOwnsRuntimeId(session, sessionId))?.profile ?? null
+}
+
+export function clarifyRequestFromPayload(
+  payload: GatewayEventPayload | undefined,
+  sessionId: null | string,
+  sessions: SessionInfo[]
+): ClarifyRequest | null {
+  const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+  const question = typeof payload?.question === 'string' ? payload.question : ''
+
+  if (!requestId || !question) {
+    return null
+  }
+
+  const clarifyPayload = payload as Record<string, unknown>
+  const rawChoices = Array.isArray(payload?.choices) ? payload.choices : null
+  const profile = typeof clarifyPayload.profile === 'string' ? clarifyPayload.profile : profileForSession(sessionId, sessions)
+
+  return {
+    requestId,
+    question,
+    choices: rawChoices ? rawChoices.filter((choice: unknown): choice is string => typeof choice === 'string') : null,
+    sessionId: sessionId ?? null,
+    multiSelect: clarifyPayload.multi_select === true || clarifyPayload.multiSelect === true,
+    minSelections: typeof clarifyPayload.min_selections === 'number' ? clarifyPayload.min_selections : null,
+    maxSelections: typeof clarifyPayload.max_selections === 'number' ? clarifyPayload.max_selections : null,
+    allowOther: clarifyPayload.allow_other !== false,
+    profile
+  }
 }
 
 /** The gateway-event dispatcher, extracted from useMessageStream. */
@@ -425,21 +467,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // indefinitely and re-focusing it could never recover (the event is
         // gone). Parking it per-session lets the user answer once they switch
         // over; the inline ClarifyTool reads the active session's entry.
-        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
-        const question = typeof payload?.question === 'string' ? payload.question : ''
-        const clarifyPayload = payload as Record<string, unknown> | undefined
+        const request = clarifyRequestFromPayload(payload, sessionId ?? null, $sessions.get())
 
-        if (requestId && question) {
-          setClarifyRequest({
-            requestId,
-            question,
-            choices: Array.isArray(payload?.choices) ? payload!.choices!.filter((c): c is string => typeof c === 'string') : null,
-            sessionId: sessionId ?? null,
-            multiSelect: clarifyPayload?.multi_select === true || clarifyPayload?.multiSelect === true,
-            minSelections: typeof clarifyPayload?.min_selections === 'number' ? clarifyPayload.min_selections : null,
-            maxSelections: typeof clarifyPayload?.max_selections === 'number' ? clarifyPayload.max_selections : null,
-            allowOther: clarifyPayload?.allow_other !== false
-          })
+        if (request) {
+          setClarifyRequest(request)
 
           // The transcript only renders the active session, so a background
           // clarify is otherwise invisible (the row just keeps spinning like
@@ -451,7 +482,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           dispatchNativeNotification({
-            body: question,
+            body: request.question,
             kind: 'input',
             sessionId,
             title: translateNow('notifications.native.inputTitle')

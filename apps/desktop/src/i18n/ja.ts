@@ -2221,7 +2221,11 @@ export const ja = defineLocale({
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',
-      continueLabel: '続行'
+      continueLabel: '続行',
+      selected: '選択済み',
+      selectedCount: count => `${count} 件選択済み`,
+      multiSelectHint: '複数選択：右側の丸で選択肢を一時選択し、「選択した項目を送信」を押してください。',
+      selectSelected: '選択した項目を送信'
     },
     tool: {
       code: 'コード',

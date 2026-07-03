@@ -11,6 +11,7 @@ export interface ClarifyRequest {
   minSelections?: null | number
   maxSelections?: null | number
   allowOther?: boolean
+  profile?: null | string
 }
 
 // Pending clarify requests keyed by the runtime session id that raised them.

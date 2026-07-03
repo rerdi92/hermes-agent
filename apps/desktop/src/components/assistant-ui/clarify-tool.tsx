@@ -13,7 +13,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Check, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $clarifyRequest, clearClarifyRequest } from '@/store/clarify'
-import { $gateway } from '@/store/gateway'
+import { $gateway, getGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 
 interface ClarifyArgs {
@@ -162,7 +162,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const request = useStore($clarifyRequest)
-  const gateway = useStore($gateway)
+  const activeGateway = useStore($gateway)
   const fromArgs = useMemo(() => readClarifyArgs(args), [args])
 
   const matchingRequest = useMemo(() => {
@@ -212,6 +212,8 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
         return
       }
+
+      const gateway = matchingRequest.profile ? getGatewayForProfile(matchingRequest.profile) : activeGateway
 
       if (!gateway) {
         notifyError(new Error(copy.gatewayDisconnected), copy.sendFailed)
@@ -268,7 +270,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
       copy.responsePendingMessage,
       copy.responsePendingTitle,
       copy.sendFailed,
-      gateway,
+      activeGateway,
       matchingRequest,
       ready
     ]
