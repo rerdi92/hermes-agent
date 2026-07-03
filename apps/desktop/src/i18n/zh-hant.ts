@@ -2178,11 +2178,19 @@ export const zhHant = defineLocale({
       notReady: '澄清請求尚未就緒',
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送澄清回應',
+      responsePendingTitle: '澄清回應可能仍在處理中',
+      responsePendingMessage: 'Hermes 未能及時確認這次選擇。後端可能仍會收到它，請稍等片刻再重試，以避免重複回應。',
+      responseExpiredTitle: '澄清請求已過期',
+      responseExpiredMessage: '該選擇請求已不再等待回應。請等 Hermes 再次詢問後，回答新的提示。',
       loadingQuestion: '正在載入問題…',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',
       skip: '略過',
-      continueLabel: '繼續'
+      continueLabel: '繼續',
+      selected: '已選取',
+      selectedCount: count => `已選取 ${count} 項`,
+      multiSelectHint: '多選：使用右側圓點暫存選項，然後按「送出已選取」。',
+      selectSelected: '送出已選取'
     },
     tool: {
       code: '程式碼',

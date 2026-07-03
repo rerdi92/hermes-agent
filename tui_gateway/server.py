@@ -4804,7 +4804,13 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    auto_skills: Any = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -4812,8 +4818,22 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     consecutive-user merge in ``repair_message_sequence``) so nothing the user
     typed is dropped. ``transport`` is pinned so the drained turn streams back to
     the client that sent it even if the session transport is rebound meanwhile.
+    Desktop auto-skill metadata is preserved until drain time so queued FLT/ULW/
+    ULR prompts still receive the compact activation contract.
     """
     existing = session.get("queued_prompt")
+    queued_auto_skills: list[str] = []
+    for source in ((existing or {}).get("auto_skills"), auto_skills):
+        if isinstance(source, str):
+            values = [source]
+        elif isinstance(source, (list, tuple)):
+            values = source
+        else:
+            values = []
+        for item in values:
+            name = str(item).strip()
+            if name and name not in queued_auto_skills:
+                queued_auto_skills.append(name)
     if (
         existing
         and isinstance(existing.get("text"), str)
@@ -4821,10 +4841,21 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    queued_prompt = {"text": text, "transport": transport}
+    if queued_auto_skills:
+        queued_prompt["auto_skills"] = queued_auto_skills
+    session["queued_prompt"] = queued_prompt
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+def _handle_busy_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    auto_skills: Any = None,
+) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
@@ -4853,7 +4884,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    _enqueue_prompt(session, text, transport, auto_skills=auto_skills)
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
 
@@ -4874,7 +4905,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        run_text = _auto_skills_prompt(
+            queued["text"],
+            queued.get("auto_skills"),
+            task_id=session.get("session_key") or sid,
+        )
+        _run_prompt_submit(rid, sid, session, run_text)
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -8138,9 +8174,119 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+_DESKTOP_AUTO_SKILL_CONTRACTS = {
+    "hq-agent-collaboration": (
+        "Announce `[hq-agent-collaboration] 발동!` once when actively used. "
+        "Use Agent Fleet/Kanban only when role separation, durable audit, or "
+        "independent review is actually useful; avoid agent theater. Before "
+        "creating cards, run the Fleet preflight checks and include safety "
+        "bounds/evidence paths. Stop at approval boundaries."
+    ),
+    "ulw": (
+        "Open with `ULTRAWORK MODE ENABLED!` when execution mode is active. "
+        "Plan enough to act, use todo for 3+ steps, parallelize independent "
+        "work, execute safe concrete steps, and verify with real tool output "
+        "before claiming done. Respect secrets/ELIOS/admin/destructive/Gateway "
+        "restart/publish/paid-call safety gates."
+    ),
+    "ultraresearch": (
+        "Open with `ULTRARESEARCH MODE ENABLED!` when the task is explicitly "
+        "a research deliverable. Define axes, use multiple source classes, "
+        "parallelize exploration, empirically verify contested/local claims, "
+        "cite evidence, and label uncertainty. Do not use exhaustive research "
+        "for quick implementation-only turns."
+    ),
+}
+
+
+def _desktop_auto_skill_compact_message(
+    skill_name: str,
+    display_name: str,
+    description: str,
+) -> str:
+    """Return a compact activation payload for Desktop status-bar auto skills.
+
+    Desktop FLT/ULW/ULR toggles can attach several long orchestration skills to
+    every prompt. Regular slash-skill loading intentionally includes the full
+    SKILL.md and supporting-file hints, but doing that automatically makes
+    ordinary turns extremely heavy. Auto-mode keeps the behavioral contract and
+    defers the full runbook to `skill_view` only when the turn genuinely needs
+    detailed procedures.
+    """
+    contract = _DESKTOP_AUTO_SKILL_CONTRACTS.get(skill_name)
+    if not contract:
+        contract = "Follow the skill's high-level purpose, and load its full runbook only if needed."
+    desc = description.strip() or "No description available."
+    return "\n".join(
+        [
+            f'[IMPORTANT: The "{display_name}" skill is auto-loaded by the Hermes Desktop FLT/ULW/ULR mode toggles.]',
+            f"Skill: {skill_name} — {desc}",
+            "Compact auto-load mode: do not assume the full SKILL.md is already in context; call `skill_view` for this skill only if the detailed runbook is necessary for the current turn.",
+            f"Contract: {contract}",
+        ]
+    )
+
+
+def _auto_skills_prompt(text: Any, auto_skills: Any, task_id: str | None = None) -> Any:
+    """Expand Desktop FLT/ULW/ULR mode toggles into compact skill payloads."""
+    if not isinstance(text, str):
+        return text
+    if isinstance(auto_skills, str):
+        skill_names = [auto_skills]
+    elif isinstance(auto_skills, (list, tuple)):
+        skill_names = [str(item) for item in auto_skills if str(item).strip()]
+    else:
+        skill_names = []
+
+    allowed = {"hq-agent-collaboration", "ulw", "ultrawork", "ultraresearch"}
+    ordered = []
+    seen = set()
+    for raw_name in skill_names:
+        name = raw_name.strip()
+        if name == "ultrawork":
+            name = "ulw"
+        if name not in allowed or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+
+    if not ordered:
+        return text
+
+    try:
+        from agent.skill_commands import _load_skill_payload
+
+        parts = []
+        for skill_name in ordered:
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                print(f"[tui_gateway] desktop auto-skill not found: {skill_name}", file=sys.stderr)
+                continue
+            loaded_skill, _skill_dir, display_name = loaded
+            parts.append(
+                _desktop_auto_skill_compact_message(
+                    skill_name,
+                    display_name,
+                    str(loaded_skill.get("description") or ""),
+                )
+            )
+
+        if not parts:
+            return text
+        parts.append(
+            "The user has provided the following instruction alongside the skill invocation: "
+            f"{text.strip()}"
+        )
+        return "\n\n".join(parts)
+    except Exception as exc:
+        print(f"[tui_gateway] desktop auto-skill expansion failed: {exc}", file=sys.stderr)
+        return text
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
+    auto_skills = params.get("auto_skills")
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     session, err = _sess_nowait(params, rid)
     if err:
@@ -8156,7 +8302,14 @@ def _(rid, params: dict) -> dict:
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
-            return _handle_busy_submit(rid, sid, session, text, t or session.get("transport"))
+            return _handle_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+                auto_skills=auto_skills,
+            )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -8219,7 +8372,8 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        run_text = _auto_skills_prompt(text, auto_skills, task_id=session.get("session_key") or sid)
+        _run_prompt_submit(rid, sid, session, run_text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

@@ -74,6 +74,26 @@ export function activeGateway(): HermesGateway | null {
   return secondaries.get(activeKey)?.gateway ?? primaryGateway
 }
 
+export function getGatewayForProfile(profile: null | string | undefined): HermesGateway | null {
+  const key = normKey(profile)
+
+  if (key === primaryProfile) {
+    return primaryGateway
+  }
+
+  return secondaries.get(key)?.gateway ?? null
+}
+
+export function stampSecondaryEventProfile(event: GatewayEvent, profile: string): GatewayEvent {
+  const payload = event.payload
+
+  const stampedPayload = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? { ...(payload as Record<string, unknown>), profile }
+    : payload
+
+  return { ...event, payload: stampedPayload }
+}
+
 // Mirror a backend's connection state into the global composer state, but only
 // when that backend is the one the user is currently looking at. Lets the
 // composer reflect the active profile's socket without a background reconnect
@@ -164,8 +184,10 @@ function createSecondary(profile: string): Secondary {
     wantOpen: true
   }
 
-  entry.offEvent = gateway.onEvent(event => config?.onEvent(event))
-  entry.offState = gateway.onState(state => {
+  entry.offEvent = gateway.onEvent((event: GatewayEvent) => {
+    config?.onEvent(stampSecondaryEventProfile(event, profile))
+  })
+  entry.offState = gateway.onState((state: ConnectionState) => {
     reportGatewayState(profile, state)
 
     if (state === 'open') {

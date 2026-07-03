@@ -2245,11 +2245,20 @@ export const ja = defineLocale({
       notReady: '明確化リクエストはまだ準備できていません',
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
+      responsePendingTitle: '明確化応答はまだ処理中の可能性があります',
+      responsePendingMessage:
+        'Hermes は選択を時間内に確認できませんでした。バックエンドにはまだ届く可能性があるため、重複応答を避けるため少し待ってから再試行してください。',
+      responseExpiredTitle: '明確化リクエストの期限が切れました',
+      responseExpiredMessage: 'その選択リクエストはもう保留中ではありません。Hermes が再度質問するまで待ってから、新しいプロンプトに回答してください。',
       loadingQuestion: '質問を読み込み中…',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',
-      continueLabel: '続行'
+      continueLabel: '続行',
+      selected: '選択済み',
+      selectedCount: count => `${count} 件選択済み`,
+      multiSelectHint: '複数選択：右側の丸で選択肢を一時選択し、「選択した項目を送信」を押してください。',
+      selectSelected: '選択した項目を送信'
     },
     tool: {
       code: 'コード',

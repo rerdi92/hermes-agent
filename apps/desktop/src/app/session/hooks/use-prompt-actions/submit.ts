@@ -5,6 +5,7 @@ import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { applyUltraModePrefix, ultraModeSkills } from '@/lib/skill-mode-prefix'
 import {
   $composerAttachments,
   clearComposerAttachments,
@@ -13,7 +14,14 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import {
+  $agentFleetActive,
+  $ultraresearchActive,
+  $ultraworkActive,
+  setAwaitingResponse,
+  setBusy,
+  setMessages
+} from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -245,7 +253,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(sessionId)
-        const text = buildContextText(syncedAttachments)
+
+        const ultraModes = {
+          agentFleet: $agentFleetActive.get(),
+          ultraresearch: $ultraresearchActive.get(),
+          ultrawork: $ultraworkActive.get()
+        }
+
+        const autoSkills = ultraModeSkills(ultraModes)
+        const contextText = buildContextText(syncedAttachments)
+        const text = autoSkills.length ? contextText : applyUltraModePrefix(contextText, ultraModes)
+
+        const submitPayload = (targetSessionId: string) => ({
+          session_id: targetSessionId,
+          text,
+          ...(autoSkills.length > 0 ? { auto_skills: autoSkills } : {})
+        })
 
         // On sleep/wake the gateway's in-memory session may have been cleared
         // while the desktop app still holds the old session ID. Detect this,
@@ -254,7 +277,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            requestGateway('prompt.submit', submitPayload(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
@@ -268,7 +291,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             if (recoveredId) {
               activeSessionIdRef.current = recoveredId
               await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestGateway('prompt.submit', submitPayload(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )
             } else {
               submitErr = firstErr

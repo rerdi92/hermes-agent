@@ -36,6 +36,20 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('cron.promptPlaceholder')).toBe('代理每次執行時應做什麼？')
   })
 
+  it('keeps clarify multi-select copy localized for newly supported locales', () => {
+    setRuntimeI18nLocale('ja')
+    expect(translateNow('assistant.clarify.selected')).toBe('選択済み')
+    expect(translateNow('assistant.clarify.selectedCount', 2)).toBe('2 件選択済み')
+    expect(translateNow('assistant.clarify.multiSelectHint')).toContain('右側の丸')
+    expect(translateNow('assistant.clarify.selectSelected')).toBe('選択した項目を送信')
+
+    setRuntimeI18nLocale('zh-hant')
+    expect(translateNow('assistant.clarify.selected')).toBe('已選取')
+    expect(translateNow('assistant.clarify.selectedCount', 2)).toBe('已選取 2 項')
+    expect(translateNow('assistant.clarify.multiSelectHint')).toContain('右側圓點')
+    expect(translateNow('assistant.clarify.selectSelected')).toBe('送出已選取')
+  })
+
   it('translates settings copy for newly supported locales', () => {
     setRuntimeI18nLocale('ja')
     expect(translateNow('settings.appearance.title')).toBe('外観')
