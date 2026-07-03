@@ -1472,6 +1472,7 @@ def _get_platform_tools(
                 if not _toolset_allowed_for_platform(ts_key, platform):
                     continue
 
+
                 # Compare the toolset's STATIC membership: a tool registered
                 # into a toolset (e.g. delegate_cli -> delegation, desktop-only
                 # read_terminal -> terminal) that the composite never listed must
@@ -1499,6 +1500,7 @@ def _get_platform_tools(
         for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
             if not _toolset_allowed_for_platform(ts_key, platform):
                 continue
+
 
             # Compare the toolset's STATIC membership against the composite (see
             # issue #49622): get_toolset() merges registry-registered tools into

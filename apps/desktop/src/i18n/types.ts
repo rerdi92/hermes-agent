@@ -1876,6 +1876,8 @@ export interface Translations {
       sendFailed: string
       responsePendingTitle: string
       responsePendingMessage: string
+      responseExpiredTitle: string
+      responseExpiredMessage: string
       loadingQuestion: string
       other: string
       placeholder: string

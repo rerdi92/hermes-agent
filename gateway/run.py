@@ -6669,6 +6669,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
 
+
         reason = _own_policy_open_startup_violation(self.config)
         if reason:
             platform_value = reason.split(":", 1)[0]
@@ -6690,6 +6691,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             self._request_clean_exit(reason)
             return True
+
 
 
         # Discover Python plugins before shell hooks so plugin block
@@ -17324,8 +17326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
 
-
-            # Combine platform context, YAML channel_prompts hint for this chat,
+# Combine platform context, YAML channel_prompts hint for this chat,
             # channel_overrides system_prompt (or global ephemeral), and gateway
             # ephemeral prompt from _get_system_prompt_for_channel.
 
@@ -20251,6 +20252,7 @@ def main():
         else:
             exit_code = 1
     _exit_after_graceful_shutdown(exit_code)
+
 
 
 

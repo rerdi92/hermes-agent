@@ -1026,6 +1026,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform = "tui"
             chat_id = session_key
 
+
         thread_id = (
             get_session_env("HERMES_SESSION_THREAD_ID", "")
             or os.environ.get("HERMES_SESSION_THREAD_ID", "")
@@ -1038,6 +1039,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
+
 
 
         # Lazy-import to keep the module-level dependency light

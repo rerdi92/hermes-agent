@@ -2211,6 +2211,7 @@ def _scan_assembled_cron_prompt(
 
 
 
+
 def _evaluate_cron_pre_dispatch_gate(job: dict) -> dict[str, Any] | None:
     """Run deterministic and plugin cron gates before a cron job dispatches.
 
@@ -2247,6 +2248,8 @@ def _evaluate_cron_pre_dispatch_gate(job: dict) -> dict[str, Any] | None:
     except Exception as exc:
         logger.warning("pre_cron_dispatch plugin invocation failed for job %s: %s", job.get("id", "?"), exc)
     return None
+
+
 
 def _guard_job_credential_exfil(job: dict) -> None:
     """Fail closed if a job's stored provider/base_url pair would exfiltrate a
@@ -2292,6 +2295,7 @@ def _guard_job_credential_exfil(job: dict) -> None:
             job_id, err,
         )
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
+
 
 
 

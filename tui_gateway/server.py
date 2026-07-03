@@ -175,6 +175,16 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # everything else stays on the main thread so ordering stays sane for the
 # fast path.  write_json is already _stdout_lock-guarded, so concurrent
 # response writes are safe.
+#
+# Dispatch policy contract:
+# - Add every frontend-polled RPC here unless it is proven in-memory-only.
+#   “Small” DB/file/network/process reads still starve the WS read loop under
+#   GIL pressure because handle_ws awaits dispatch() before reading the next
+#   frame on that socket (#50005).
+# - Keep truly trivial control responses inline so ordering stays predictable.
+# - Do not move live agent/session mutation into a ProcessPool without an
+#   explicit serialization boundary; use this thread pool or a dedicated
+#   subprocess instead.
 _LONG_HANDLERS = frozenset(
     {
         "billing.step_up",
@@ -202,6 +212,7 @@ _LONG_HANDLERS = frozenset(
         "pet.generate",
         "pet.hatch",
         "pet.info",
+        "pet.info.meta",
         "pet.select",
         "pet.thumb",
         "learning.frames",
@@ -1873,6 +1884,16 @@ def _enable_gateway_prompts() -> None:
 
 
 # ── Blocking prompt factory ──────────────────────────────────────────
+
+
+def _clarify_timeout_seconds() -> int:
+    """Return the configured clarify timeout for Desktop/TUI prompts."""
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+
+        return max(1, int(get_clarify_timeout()))
+    except Exception:
+        return 3600
 
 
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
@@ -3665,6 +3686,7 @@ def _agent_cbs(sid: str) -> dict:
                 "max_selections": kw.get("max_selections"),
                 "allow_other": kw.get("allow_other", True),
             },
+            timeout=_clarify_timeout_seconds(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -9799,6 +9821,8 @@ def _coerce_clarify_response_from_payload(payload: dict, answer: str) -> tuple[b
     if not text:
         if multi_select and min_selections > 0:
             return False, "", f"Select at least {min_selections} choices."
+        if not multi_select and not allow_other:
+            return False, "", "Reply with one of the listed choices."
         return True, "", ""
 
     if multi_select:

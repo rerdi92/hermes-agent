@@ -91,29 +91,18 @@ def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     assert captured["ws_ping_timeout"] is None
 
 
-def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
-    """Non-loopback (public) binds MUST keep the ws ping enabled so half-open
-    connections (reverse-proxy 524, dropped Cloudflare Tunnel) raise
-    WebSocketDisconnect into the reaping path (#32377).
-
-    The invariant asserted here is that ping stays enabled (non-None, positive)
-    and the timeout is never shorter than the interval — not a frozen literal,
-    which churns every time the window is retuned. Loopback disables the ping
-    (see test_start_server_disables_ws_ping_on_loopback); this covers the
-    public-bind half-open case, so the auth gate is active here.
+def test_start_server_keeps_shorter_ws_ping_for_non_loopback(monkeypatch):
+    """Non-loopback binds sit behind tunnels/proxies, so keep a shorter 20/20
+    heartbeat under Cloudflare-style idle windows while loopback Desktop has
+    the protocol ping disabled entirely.
     """
     captured = _stub_uvicorn(monkeypatch)
-
-    # Non-loopback bind so the _is_loopback branch selects the enabled-ping
-    # window. Neutralize the auth gate so start_server reaches uvicorn.Config
-    # without requiring a registered provider (a real public bind would raise
-    # SystemExit here). The ping window keys off the host, not the auth flag.
     monkeypatch.setattr(web_server, "should_require_auth", lambda *a, **k: False)
+
     web_server.start_server(host="0.0.0.0", port=0, open_browser=False)
 
-    assert captured["ws_ping_interval"] and captured["ws_ping_interval"] > 0
-    assert captured["ws_ping_timeout"] and captured["ws_ping_timeout"] > 0
-    assert captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
+    assert captured["ws_ping_interval"] == 20.0
+    assert captured["ws_ping_timeout"] == 20.0
 
 
 def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
