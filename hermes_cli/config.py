@@ -1121,6 +1121,12 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
+        # Optional bounded re-offer policy for multiple-choice clarify prompts.
+        # Empty/Skip/timeout responses can re-open the same UI, while open-ended
+        # prompts and session interrupts remain single-shot.  Defaults preserve
+        # historical behavior; HQ opts into 3 attempts / 1200s in config.yaml.
+        "clarify_reoffer_attempts": 1,
+        "clarify_reoffer_window_seconds": 0,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

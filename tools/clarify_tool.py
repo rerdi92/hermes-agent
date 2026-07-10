@@ -12,12 +12,85 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
+import time
 from typing import List, Optional, Callable
 
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
+MAX_REOFFER_ATTEMPTS = 3
+MAX_REOFFER_WINDOW_SECONDS = 1200
+MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS = 400
+
+_CLARIFY_TIMEOUT_SENTINELS = (
+    "[clarify prompt timed out]",
+    "[user did not respond within ",
+    "the user did not provide a response within the time limit",
+)
+_CLARIFY_CANCELLED_SENTINEL = "[clarify prompt cancelled]"
+
+
+def _coerce_reoffer_policy(agent_cfg: dict) -> tuple[int, int]:
+    """Validate and hard-cap re-offer settings from an agent config mapping."""
+    try:
+        attempts = int(agent_cfg.get("clarify_reoffer_attempts", 1))
+        window = int(agent_cfg.get("clarify_reoffer_window_seconds", 0))
+    except (TypeError, ValueError):
+        return 1, 0
+
+    attempts = max(1, min(attempts, MAX_REOFFER_ATTEMPTS))
+    window = max(0, min(window, MAX_REOFFER_WINDOW_SECONDS))
+    if attempts > 1 and window == 0:
+        return 1, 0
+    return attempts, window
+
+
+def _load_reoffer_policy() -> tuple[int, int]:
+    """Return the hard-capped ``(attempts, overall_window_seconds)`` policy.
+
+    The defaults preserve historical behavior: one callback, no retry window.
+    Re-offers are opt-in and apply only to multiple-choice prompts.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        agent_cfg = cfg.get("agent", {}) or {}
+    except Exception:
+        return 1, 0
+
+    return _coerce_reoffer_policy(agent_cfg)
+
+
+def cap_clarify_attempt_timeout(timeout: int, agent_cfg: Optional[dict] = None) -> int:
+    """Cap one choice-UI wait at 400s only when bounded re-offer is enabled."""
+    try:
+        normalized_timeout = max(1, int(timeout))
+    except (TypeError, ValueError):
+        normalized_timeout = MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS
+
+    policy = _coerce_reoffer_policy(agent_cfg) if agent_cfg is not None else _load_reoffer_policy()
+    if policy[0] > 1:
+        return min(normalized_timeout, MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS)
+    return normalized_timeout
+
+
+def _is_retryable_no_selection(response: str) -> bool:
+    """True for Skip/empty and known platform timeout sentinels."""
+    normalized = str(response or "").strip().lower()
+    if not normalized:
+        return True
+    return any(normalized.startswith(prefix) for prefix in _CLARIFY_TIMEOUT_SENTINELS)
+
+
+def _selection_status(response: str) -> str:
+    normalized = str(response or "").strip().lower()
+    if normalized.startswith(_CLARIFY_CANCELLED_SENTINEL):
+        return "cancelled"
+    if _is_retryable_no_selection(normalized):
+        return "no_selection"
+    return "answered"
 
 
 def _flatten_choice(c) -> str:
@@ -98,19 +171,50 @@ def clarify_tool(
             ensure_ascii=False,
         )
 
-    try:
-        user_response = callback(question, choices)
-    except Exception as exc:
-        return json.dumps(
-            {"error": f"Failed to get user input: {exc}"},
-            ensure_ascii=False,
-        )
+    configured_attempts, window_seconds = _load_reoffer_policy()
+    configured_attempts = min(max(1, configured_attempts), MAX_REOFFER_ATTEMPTS)
+    window_seconds = min(max(0, window_seconds), MAX_REOFFER_WINDOW_SECONDS)
+    max_attempts = configured_attempts if choices is not None else 1
+    deadline = time.monotonic() + window_seconds if window_seconds > 0 else None
+    attempts_used = 0
+    user_response = ""
 
-    return json.dumps({
+    for attempt_index in range(max_attempts):
+        if attempt_index > 0 and deadline is not None and time.monotonic() >= deadline:
+            break
+        try:
+            user_response = callback(question, choices)
+        except Exception as exc:
+            return json.dumps(
+                {"error": f"Failed to get user input: {exc}"},
+                ensure_ascii=False,
+            )
+        attempts_used += 1
+        if not _is_retryable_no_selection(user_response):
+            break
+
+    status = _selection_status(user_response)
+    no_consent = choices is not None and status == "no_selection"
+    if no_consent:
+        status = "no_consent"
+
+    result = {
         "question": question,
         "choices_offered": choices,
         "user_response": str(user_response).strip(),
-    }, ensure_ascii=False)
+        "attempts_used": attempts_used,
+        "selection_status": status,
+    }
+    if no_consent:
+        result.update({
+            "reoffer_exhausted": True,
+            "consent_inferred": False,
+            "decision_instruction": (
+                "No selection was captured. Do not infer consent or execute side effects; "
+                "leave the pending action paused."
+            ),
+        })
+    return json.dumps(result, ensure_ascii=False)
 
 
 def check_clarify_requirements() -> bool:

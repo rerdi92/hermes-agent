@@ -136,7 +136,7 @@ class TestClarifyPrimitive:
         assert result is False
 
     def test_clear_session_cancels_pending_entries(self):
-        """clear_session unblocks blocked threads with empty response."""
+        """clear_session unblocks threads with an explicit cancel sentinel."""
         from tools import clarify_gateway as cm
 
         cm.register("id7", "sk7", "Q?", ["A"])
@@ -150,8 +150,7 @@ class TestClarifyPrimitive:
             cancelled = cm.clear_session("sk7")
             assert cancelled == 1
             result = fut.result(timeout=2.0)
-            # clear_session sets response="" then the wait returns it
-            assert result == ""
+            assert result == cm.CLARIFY_CANCELLED_SENTINEL
 
     def test_has_pending(self):
         from tools import clarify_gateway as cm
@@ -176,9 +175,19 @@ class TestClarifyPrimitive:
             cm.register_notify("sk9", lambda entry: None)
             cm.unregister_notify("sk9")
 
-            # unregister_notify calls clear_session; thread unwinds
+            # unregister_notify calls clear_session; thread unwinds as cancel
             result = fut.result(timeout=2.0)
-            assert result == ""
+            assert result == cm.CLARIFY_CANCELLED_SENTINEL
+
+    def test_format_wait_result_preserves_skip_and_cancel(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.format_wait_result("", 400) == ""
+        assert (
+            cm.format_wait_result(cm.CLARIFY_CANCELLED_SENTINEL, 400)
+            == cm.CLARIFY_CANCELLED_SENTINEL
+        )
+        assert cm.format_wait_result(None, 400).startswith("[user did not respond within ")
 
     def test_session_index_isolation(self):
         """Entries from different sessions don't leak across get_pending lookups."""
@@ -193,14 +202,29 @@ class TestClarifyPrimitive:
         assert b is not None and b.clarify_id == "idB"
 
     def test_clarify_timeout_config_default(self):
-        """get_clarify_timeout returns a positive int (default 3600)."""
+        """get_clarify_timeout returns a positive int from active config."""
         from tools import clarify_gateway as cm
 
         timeout = cm.get_clarify_timeout()
-        # Default 3600s OR whatever is in the user's loaded config.
-        # Floor check: must be a positive int, not crashed.
         assert isinstance(timeout, int)
         assert timeout > 0
+
+    def test_choice_timeout_is_hard_capped_when_reoffer_enabled(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "agent": {
+                    "clarify_timeout": 3600,
+                    "clarify_reoffer_attempts": 9,
+                    "clarify_reoffer_window_seconds": 9999,
+                }
+            },
+        )
+
+        assert cm.get_clarify_timeout(["A", "B"]) == 400
+        assert cm.get_clarify_timeout(None) == 3600
 
 
 class TestGatewayTextIntercept:

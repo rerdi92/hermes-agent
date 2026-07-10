@@ -645,6 +645,37 @@ class TestPersistPromptSummary:
         assert "Pick a path?" in summary
         assert "B" in summary
 
+    def test_choice_clarify_deadline_uses_reoffer_hard_cap(self):
+        cli = _make_cli_stub()
+        cli._clarify_state = None
+        cli._clarify_freetext = False
+        cli._clarify_deadline = 0
+        result = {}
+
+        def _run():
+            result["value"] = cli._clarify_callback("Pick?", ["A", "B"])
+
+        with patch.dict(cli_module.CLI_CONFIG["clarify"], {"timeout": 3600}), \
+             patch.dict(
+                 cli_module.CLI_CONFIG["agent"],
+                 {
+                     "clarify_reoffer_attempts": 9,
+                     "clarify_reoffer_window_seconds": 9999,
+                 },
+             ), \
+             patch.object(cli_module, "_cprint", lambda *_: None):
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            deadline = time.time() + 2
+            while cli._clarify_state is None and time.time() < deadline:
+                time.sleep(0.01)
+            remaining = cli._clarify_deadline - time.monotonic()
+            cli._clarify_state["response_queue"].put("A")
+            t.join(timeout=2)
+
+        assert 390 <= remaining <= 400
+        assert result["value"] == "A"
+
 
 class TestClearOverlaysForInterrupt:
     """Regression tests for #14026 — interrupting a running agent must clear

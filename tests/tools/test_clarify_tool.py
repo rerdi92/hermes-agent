@@ -10,6 +10,8 @@ from tools.clarify_tool import (
     MAX_CHOICES,
     CLARIFY_SCHEMA,
     _flatten_choice,
+    _load_reoffer_policy,
+    cap_clarify_attempt_timeout,
 )
 
 
@@ -155,6 +157,149 @@ class TestClarifyToolCallbackHandling:
 
         result = json.loads(clarify_tool("Q?", callback=mock_callback))
         assert result["user_response"] == "response with spaces"
+
+
+class TestClarifyReofferPolicy:
+    """Multiple-choice prompts may re-open after a retryable no-selection."""
+
+    def test_attempts_without_window_fail_safe_to_single_shot(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"clarify_reoffer_attempts": 3}},
+        )
+
+        assert _load_reoffer_policy() == (1, 0)
+
+    def test_policy_hard_caps_high_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "agent": {
+                    "clarify_reoffer_attempts": 9,
+                    "clarify_reoffer_window_seconds": 9999,
+                }
+            },
+        )
+
+        assert _load_reoffer_policy() == (3, 1200)
+
+    def test_attempt_timeout_caps_only_when_reoffer_enabled(self):
+        enabled = {
+            "clarify_reoffer_attempts": 3,
+            "clarify_reoffer_window_seconds": 1200,
+        }
+        single_shot = {
+            "clarify_reoffer_attempts": 1,
+            "clarify_reoffer_window_seconds": 0,
+        }
+
+        assert cap_clarify_attempt_timeout(3600, enabled) == 400
+        assert cap_clarify_attempt_timeout(3600, single_shot) == 3600
+
+    def test_reoffers_empty_choice_until_answer(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        responses = iter(["", "", "approved"])
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return next(responses)
+
+        result = json.loads(clarify_tool(
+            "Proceed?", choices=["approved", "defer"], callback=callback,
+        ))
+
+        assert len(calls) == 3
+        assert result["user_response"] == "approved"
+        assert result["attempts_used"] == 3
+        assert result["selection_status"] == "answered"
+        assert result.get("reoffer_exhausted") is not True
+
+    def test_exhausted_choice_returns_explicit_no_consent(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return ""
+
+        result = json.loads(clarify_tool(
+            "Proceed?", choices=["approve", "defer"], callback=callback,
+        ))
+
+        assert len(calls) == 3
+        assert result["attempts_used"] == 3
+        assert result["selection_status"] == "no_consent"
+        assert result["reoffer_exhausted"] is True
+        assert result["consent_inferred"] is False
+        assert "Do not infer consent" in result["decision_instruction"]
+
+    def test_open_ended_prompt_is_never_reoffered(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return ""
+
+        result = json.loads(clarify_tool("Explain", callback=callback))
+
+        assert len(calls) == 1
+        assert result["attempts_used"] == 1
+        assert result["selection_status"] == "no_selection"
+
+    def test_cancelled_choice_prompt_is_not_reoffered(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return "[clarify prompt cancelled]"
+
+        result = json.loads(clarify_tool(
+            "Proceed?", choices=["yes", "no"], callback=callback,
+        ))
+
+        assert len(calls) == 1
+        assert result["selection_status"] == "cancelled"
+
+    def test_known_cli_timeout_sentinel_is_reoffered(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        responses = iter([
+            "The user did not provide a response within the time limit. Continue safely.",
+            "defer",
+        ])
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return next(responses)
+
+        result = json.loads(clarify_tool(
+            "Proceed?", choices=["run", "defer"], callback=callback,
+        ))
+
+        assert len(calls) == 2
+        assert result["user_response"] == "defer"
+
+    def test_window_expiry_stops_before_next_reoffer(self, monkeypatch):
+        monkeypatch.setattr("tools.clarify_tool._load_reoffer_policy", lambda: (3, 1200))
+        ticks = iter([100.0, 1301.0])
+        monkeypatch.setattr("tools.clarify_tool.time.monotonic", lambda: next(ticks))
+        calls = []
+
+        def callback(question, choices):
+            calls.append((question, choices))
+            return ""
+
+        result = json.loads(clarify_tool(
+            "Proceed?", choices=["yes", "no"], callback=callback,
+        ))
+
+        assert len(calls) == 1
+        assert result["attempts_used"] == 1
+        assert result["selection_status"] == "no_consent"
+        assert result["reoffer_exhausted"] is True
 
 
 class TestCheckClarifyRequirements:

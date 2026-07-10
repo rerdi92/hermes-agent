@@ -2028,6 +2028,25 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+_CLARIFY_TIMEOUT_SENTINEL = "[clarify prompt timed out]"
+_CLARIFY_CANCELLED_SENTINEL = "[clarify prompt cancelled]"
+
+
+def _resolve_clarify_timeout(choices: list[str] | None = None) -> int:
+    """Use profile timeout; hard-cap re-offered choice prompts at 400s."""
+    try:
+        cfg = _load_cfg() or {}
+        agent_cfg = cfg.get("agent", {}) or {}
+        timeout = max(1, int(agent_cfg.get("clarify_timeout", 300)))
+        if choices:
+            from tools.clarify_tool import cap_clarify_attempt_timeout
+
+            return cap_clarify_attempt_timeout(timeout, agent_cfg)
+        return timeout
+    except Exception:
+        return 300
+
+
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
@@ -2054,11 +2073,13 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
             sid,
             {"request_id": rid},
         )
+    if event == "clarify.request" and not answered and not answer:
+        return _CLARIFY_TIMEOUT_SENTINEL
     return answer
 
 
 def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer.
+    """Release pending prompts; clarify receives an explicit cancel sentinel.
 
     When *sid* is provided, only prompts owned by that session are
     released — critical for session.interrupt, which must not
@@ -2069,7 +2090,12 @@ def _clear_pending(sid: str | None = None) -> None:
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                pending_event = _pending_prompt_payloads.get(rid, ("", {}))[0]
+                _answers[rid] = (
+                    _CLARIFY_CANCELLED_SENTINEL
+                    if pending_event == "clarify.request"
+                    else ""
+                )
                 ev.set()
 
 
@@ -3911,7 +3937,10 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request",
+            sid,
+            {"question": q, "choices": c},
+            timeout=_resolve_clarify_timeout(c),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.

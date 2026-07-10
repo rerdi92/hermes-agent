@@ -5219,6 +5219,61 @@ def test_interrupt_clears_multiple_own_pending():
             server._answers.pop(key, None)
 
 
+def test_interrupt_marks_known_clarify_prompt_cancelled():
+    """Interrupt must not look like Skip/timeout to the re-offer policy."""
+    import types
+
+    sess = _session()
+    sess["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["sid"] = sess
+    event = threading.Event()
+
+    try:
+        server._pending["rid"] = ("sid", event)
+        server._pending_prompt_payloads["rid"] = (
+            "clarify.request",
+            {"request_id": "rid", "question": "Proceed?", "choices": ["yes", "no"]},
+        )
+
+        response = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert response.get("result")
+        assert event.is_set()
+        assert server._answers.get("rid") == server._CLARIFY_CANCELLED_SENTINEL
+    finally:
+        server._sessions.pop("sid", None)
+        server._pending.pop("rid", None)
+        server._pending_prompt_payloads.pop("rid", None)
+        server._answers.pop("rid", None)
+
+
+def test_clarify_block_timeout_returns_retryable_sentinel(monkeypatch):
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    result = server._block("clarify.request", "sid", {"question": "Proceed?"}, timeout=0)
+
+    assert result == server._CLARIFY_TIMEOUT_SENTINEL
+
+
+def test_resolve_clarify_timeout_uses_agent_config(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "agent": {
+                "clarify_timeout": 3600,
+                "clarify_reoffer_attempts": 9,
+                "clarify_reoffer_window_seconds": 9999,
+            }
+        },
+    )
+
+    assert server._resolve_clarify_timeout(["yes", "no"]) == 400
+    assert server._resolve_clarify_timeout(None) == 3600
+
+
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     """_run_prompt_submit must expose the actual turn thread to session.interrupt.
 

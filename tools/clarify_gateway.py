@@ -39,6 +39,8 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+CLARIFY_CANCELLED_SENTINEL = "[clarify prompt cancelled]"
+
 
 # =========================================================================
 # Module-level state
@@ -248,38 +250,43 @@ def clear_session(session_key: str) -> int:
     for entry in entries:
         if entry is None:
             continue
-        # Empty string sentinel — agent code can distinguish from a real
-        # response by inspecting the wait_for_response return value
-        # alongside its own timeout deadline.  Most callers just treat any
-        # falsy result as "user did not respond".
-        entry.response = ""
+        # Keep explicit session cancellation distinct from Skip/empty and
+        # timeout so the bounded re-offer policy never resurrects /stop,
+        # /new, cached-agent eviction, or gateway shutdown.
+        entry.response = CLARIFY_CANCELLED_SENTINEL
         entry.event.set()
         cancelled += 1
     return cancelled
+
+
+def format_wait_result(response: Optional[str], timeout: int) -> str:
+    """Normalize a gateway wait result without collapsing cancel into timeout."""
+    if response is None:
+        return f"[user did not respond within {int(timeout / 60)}m]"
+    return str(response)
 
 
 # =========================================================================
 # Config
 # =========================================================================
 
-def get_clarify_timeout() -> int:
-    """Read the clarify response timeout (seconds) from config.
+def get_clarify_timeout(choices: Optional[List[str]] = None) -> int:
+    """Read the clarify wait from config and cap re-offered choice prompts.
 
-    Defaults to 3600 (1 hour) — long enough that a user who steps away
-    (meeting, AFK, slow to read) still finds a live entry when they tap
-    the button, short enough that a genuinely abandoned prompt eventually
-    unblocks the agent thread instead of pinning the running-agent guard
-    forever.  The old 600s default evicted the entry mid-think, so a late
-    tap landed on a dead entry and the agent hung on ``running: clarify``
-    (#32762).
-
-    Reads ``agent.clarify_timeout`` from config.yaml.
+    Historical single-shot/open-ended prompts keep the configured timeout.
+    When bounded multiple-choice re-offer is enabled, each attempt is capped
+    at 400 seconds so three attempts fit inside the 1200-second global window.
     """
     try:
         from hermes_cli.config import load_config
+        from tools.clarify_tool import cap_clarify_attempt_timeout
+
         cfg = load_config() or {}
         agent_cfg = cfg.get("agent", {}) or {}
-        return int(agent_cfg.get("clarify_timeout", 3600))
+        timeout = int(agent_cfg.get("clarify_timeout", 3600))
+        if choices:
+            return cap_clarify_attempt_timeout(timeout, agent_cfg)
+        return max(1, timeout)
     except Exception:
         return 3600
 

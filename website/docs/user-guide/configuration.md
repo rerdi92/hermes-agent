@@ -1947,12 +1947,19 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 ## Clarify
 
-Configure the clarification prompt behavior:
+Configure clarification prompt behavior. The per-attempt timeout is surface-specific for backward compatibility, while the bounded re-offer policy lives under `agent` and applies only to multiple-choice prompts:
 
 ```yaml
 clarify:
-  timeout: 120                 # Seconds to wait for user clarification response
+  timeout: 400                       # Interactive CLI wait per attempt
+
+agent:
+  clarify_timeout: 400               # Gateway/Desktop/TUI wait per attempt
+  clarify_reoffer_attempts: 3        # Total displays, including the first
+  clarify_reoffer_window_seconds: 1200  # Overall retry window (20 minutes)
 ```
+
+Re-offers happen only after Skip/empty/known timeout responses. Open-ended prompts, explicit cancellation, session interrupt, and shutdown remain single-shot. Defaults preserve historical behavior (`clarify_reoffer_attempts: 1`, window disabled) unless the user opts in. When enabled, runtime hard caps override larger values: at most 3 total displays, a 1200-second overall window, and 400 seconds per multiple-choice attempt. Exhaustion returns `selection_status: no_consent` plus an explicit instruction to keep side effects paused.
 
 ## Context Files (SOUL.md, AGENTS.md)
 
