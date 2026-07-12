@@ -49,7 +49,8 @@ def test_cron_fire_profile_lookup_off_loop(monkeypatch, loop_probe):
         headers={"Authorization": "Bearer x"},
     )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "gone"
+    assert resp.json()["status"] == "JOB_NOT_FOUND"
+    assert resp.json()["schema"] == "hermes.cron.dispatch-result.v1"
     assert ("find", False) in seen, (
         f"_find_cron_job_profile must run off the event loop; proof: {seen}"
     )

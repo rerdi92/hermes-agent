@@ -3836,22 +3836,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if not job_id:
             return web.json_response({"error": "missing job_id"}, status=400)
 
-        from cron.scheduler_provider import resolve_cron_scheduler
-        provider = resolve_cron_scheduler()
+        from cron.quiescence import dispatch_result_to_http, request_broker_dispatch
+        from hermes_constants import get_hermes_home
 
-        loop = asyncio.get_running_loop()
-        # Fire in the background (202 immediately). fire_due claims via the
-        # store CAS, so a retry while this is in flight is de-duped.
-        task = asyncio.create_task(
-            asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+        result = await asyncio.to_thread(
+            request_broker_dispatch,
+            job_id,
+            mode="provider",
+            profile_home=get_hermes_home(),
+            timeout=1.25,
         )
-        try:
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        except (TypeError, AttributeError):
-            pass
-
-        return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+        mapped = dispatch_result_to_http(result)
+        return web.json_response(mapped.body, status=mapped.status_code)
 
 
     # ------------------------------------------------------------------

@@ -20376,6 +20376,61 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     logger.info("Gateway housekeeping stopped")
 
 
+def _gateway_process_create_time(pid: int) -> float:
+    """Read the process start time used in the broker's PID-reuse-safe identity."""
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception as exc:
+        raise RuntimeError(f"cannot establish Gateway process identity for PID {pid}") from exc
+
+
+def _create_gateway_cron_broker(*, completion_hook=None, adapters=None, loop=None):
+    """Create and atomically register the canonical same-process cron broker."""
+    from cron.quiescence import (
+        CronBroker,
+        OwnerIdentity,
+        build_live_process_snapshot_provider,
+        classify_hermes_command,
+        current_process_identity,
+        profile_home_sha256,
+    )
+    from cron.scheduler import _get_parallel_pool, _run_reserved_job_effects
+    profile_home = Path(get_hermes_home()).resolve()
+    profile_hash = profile_home_sha256(profile_home)
+    command = classify_hermes_command(sys.argv, platform=sys.platform)
+    command_kind = (
+        command.command_kind if command.dispatch_capable else "CANONICAL_GATEWAY_RUN"
+    )
+    pid, create_time = current_process_identity()
+    owner = OwnerIdentity(
+        pid=pid,
+        create_time=create_time,
+        profile_home_hash=profile_hash,
+    )
+    census_snapshot_provider, census_username = build_live_process_snapshot_provider(
+        profile_home,
+        owner,
+        owner_command_kind=command_kind,
+    )
+    broker = CronBroker(
+        profile_home=profile_home,
+        owner_identity=owner,
+        submit=lambda worker: _get_parallel_pool(None).submit(worker),
+        runner=lambda job: _run_reserved_job_effects(
+            job, adapters=adapters, loop=loop
+        ),
+        completion_hook=completion_hook,
+        census_snapshot_provider=census_snapshot_provider,
+        census_current_sid=getattr(census_snapshot_provider, "current_sid", None),
+        census_current_username=census_username,
+        census_platform=sys.platform,
+    )
+    broker.register_owner(command_kind=command_kind, argv=sys.argv)
+    return broker
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """DEPRECATED shim — preserved for backward compatibility.
 
@@ -20849,9 +20904,41 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Establish the unique unready cron owner before any platform adapter starts.
+    # The responder and scheduler remain stopped until platform startup succeeds.
+    from cron.scheduler_provider import resolve_cron_scheduler
+
+    gateway_loop = asyncio.get_running_loop()
+    cron_provider = resolve_cron_scheduler()
+    try:
+        cron_broker = _create_gateway_cron_broker(
+            completion_hook=getattr(cron_provider, "on_dispatch_completed", None),
+            adapters=None,
+            loop=gateway_loop,
+        )
+    except Exception as exc:
+        logger.error(
+            "Canonical cron broker registration failed before platform startup: %s",
+            exc,
+        )
+        return False
+    atexit.register(cron_broker.close_owner)
+
+    def _close_prestart_cron_owner() -> None:
+        try:
+            atexit.unregister(cron_broker.close_owner)
+        except Exception:
+            pass
+        cron_broker.close_owner()
+
     # Start the gateway
-    success = await runner.start()
+    try:
+        success = await runner.start()
+    except BaseException:
+        _close_prestart_cron_owner()
+        raise
     if not success:
+        _close_prestart_cron_owner()
         return False
     if runner.should_exit_cleanly:
         if runner.exit_reason:
@@ -20863,6 +20950,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Without this, the early `return True` below makes main() exit 0,
         # the finish script's `[ "$1" = "78" ]` check never matches, and
         # s6 crash-loops the gateway anyway (#51228).
+        _close_prestart_cron_owner()
         if runner.exit_code is not None:
             raise SystemExit(runner.exit_code)
         return True
@@ -20870,6 +20958,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Startup was intentionally aborted by restart/shutdown before entering
         # running mode; preserve that lifecycle path without starting cron.
         await runner.wait_for_shutdown()
+        _close_prestart_cron_owner()
         if runner.should_exit_with_failure:
             if runner.exit_reason:
                 logger.error("Gateway exiting with failure: %s", runner.exit_reason)
@@ -20888,17 +20977,82 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
+    from cron.scheduler import _run_reserved_job_effects
+
+    cron_broker.runner = lambda job: _run_reserved_job_effects(
+        job, adapters=runner.adapters, loop=gateway_loop
+    )
+    broker_request_thread = threading.Thread(
+        target=cron_broker.serve_request_queue,
+        args=(cron_stop,),
+        daemon=True,
+        name="cron-broker-requests",
+    )
+    broker_request_thread.start()
+    try:
+        if not cron_broker.wait_request_server_started(timeout=1.0):
+            raise RuntimeError("cron broker request server did not start")
+        from cron.quiescence import (
+            recover_completion_hooks,
+            serve_completion_hook_recovery_loop,
+        )
+
+        recovered_hooks = recover_completion_hooks(
+            cron_broker.profile_home,
+            cron_provider.on_dispatch_completed,
+            owner_epoch=cron_broker.owner_epoch,
+        )
+        if recovered_hooks:
+            logger.info("Recovered %d durable cron completion hook(s)", recovered_hooks)
+
+        hook_recovery_thread = threading.Thread(
+            target=serve_completion_hook_recovery_loop,
+            args=(
+                cron_stop,
+                cron_broker.profile_home,
+                cron_provider.on_dispatch_completed,
+            ),
+            kwargs={"owner_epoch": cron_broker.owner_epoch, "interval": 5.0},
+            daemon=True,
+            name="cron-hook-recovery",
+        )
+        hook_recovery_thread.start()
+        cron_broker.mark_owner_ready()
+    except Exception as exc:
+        cron_stop.set()
+        if "hook_recovery_thread" in locals():
+            hook_recovery_thread.join(timeout=1.0)
+        broker_request_thread.join(timeout=1.0)
+        cron_broker.close_owner()
+        logger.error("Canonical cron broker readiness failed: %s", exc)
+        return False
+    cron_start_kwargs = {"adapters": runner.adapters, "loop": gateway_loop}
+    try:
+        start_params = inspect.signature(cron_provider.start).parameters
+        accepts_broker = "broker" in start_params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in start_params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_broker = True
+    if accepts_broker:
+        cron_start_kwargs["broker"] = cron_broker
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs=cron_start_kwargs,
         daemon=True,
         name="cron-scheduler",
     )
-    cron_thread.start()
+    try:
+        cron_thread.start()
+    except Exception:
+        cron_stop.set()
+        hook_recovery_thread.join(timeout=1.0)
+        broker_request_thread.join(timeout=1.0)
+        cron_broker.close_owner()
+        raise
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -20906,7 +21060,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": gateway_loop},
         daemon=True,
         name="gateway-housekeeping",
     )
@@ -20922,10 +21076,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    if runner.should_exit_with_failure:
+    cron_shutdown_failed = runner.should_exit_with_failure
+    if cron_shutdown_failed:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-        return False
     
     # Stop cron scheduler + housekeeping cleanly.
     #
@@ -20946,6 +21100,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
             "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
         )
+    await _await_thread_exit(broker_request_thread, timeout=2.0)
+    hook_wait_warned = False
+    while not await _await_thread_exit(hook_recovery_thread, timeout=2.0):
+        if not hook_wait_warned:
+            logger.error(
+                "Cron hook recovery is still in-flight; delaying owner teardown "
+                "until the provider call exits"
+            )
+            hook_wait_warned = True
+    if not cron_broker.close_owner():
+        logger.error("Canonical cron broker owner cleanup was ambiguous; preserving evidence")
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
@@ -20960,6 +21125,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         shutdown_mcp_servers()
     except Exception:
         pass
+
+    if cron_shutdown_failed:
+        return False
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)

@@ -76,6 +76,38 @@ def test_cron_dispatch_func_is_injected_handler():
     assert ns.func is _sentinel_handler
 
 
+def test_cron_quiescent_exec_contract():
+    parser = _build()
+    ns = parser.parse_args(
+        [
+            "cron",
+            "quiescent-exec",
+            "--wait-timeout",
+            "300",
+            "--child-timeout",
+            "600",
+            "--expected-argv-sha256",
+            "a" * 64,
+            "--",
+            "/absolute/tool",
+            "arg",
+        ]
+    )
+    assert ns.cron_command == "quiescent-exec"
+    assert ns.wait_timeout == 300
+    assert ns.child_timeout == 600
+    assert ns.expected_argv_sha256 == "a" * 64
+    assert ns.argv[-2:] == ["/absolute/tool", "arg"]
+
+
+def test_cron_quiescence_inspect_parser_contract():
+    parser = _build()
+    ns = parser.parse_args(["cron", "quiescence", "inspect"])
+    assert ns.cron_command == "quiescence"
+    assert ns.quiescence_command == "inspect"
+    assert ns.func is _sentinel_handler
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

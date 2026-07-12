@@ -1534,11 +1534,11 @@ class TestRunJobSessionPersistence:
         assert "(FAILED)" not in output
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
-        """When run_job returns success=True but final_response is empty,
-        tick() should mark the job as error so last_status != 'ok'.
+        """When execution returns an empty response, the reserved effects body
+        marks the job as error so last_status != 'ok'.
         (issue #8585)
         """
-        from cron.scheduler import tick
+        from cron.scheduler import _run_one_job_effects
 
         job = {
             "id": "empty-job",
@@ -1551,16 +1551,13 @@ class TestRunJobSessionPersistence:
             "last_status": None,
         }
 
-        fake_db = MagicMock()
-
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
-            tick(verbose=False)
+            _run_one_job_effects(job, verbose=False)
 
         # Should be called with success=False because final_response is empty
         mock_mark.assert_called_once()
@@ -2498,73 +2495,73 @@ class TestSilentDelivery:
         }
 
     def test_silent_response_suppresses_delivery(self, caplog):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
+            from cron.scheduler import tick, _run_one_job_effects
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
     def test_silent_with_note_suppresses_delivery(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_not_called()
 
     def test_silent_trailing_suppresses_delivery(self):
         """Agent appended [SILENT] after explanation text — must still suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_not_called()
 
     def test_bracketless_silent_variants_suppress(self):
         """Bracketless near-markers the model emits when it drops brackets
         must still suppress delivery (#51438, #46917)."""
-        from cron.scheduler import tick
+        from cron.scheduler import tick, _run_one_job_effects
         for marker in ("SILENT", "NO_REPLY", "NO REPLY", "no_reply"):
-            with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+            with patch("cron.scheduler.claim_dispatch", return_value=True), \
                  patch("cron.scheduler.run_job", return_value=(True, "# output", marker, None)), \
                  patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
                  patch("cron.scheduler._deliver_result") as deliver_mock, \
                  patch("cron.scheduler.mark_job_run"):
-                tick(verbose=False)
+                _run_one_job_effects(self._make_job(), verbose=False)
             deliver_mock.assert_not_called()
 
     def test_report_quoting_marker_mid_sentence_still_delivers(self):
         """A genuine report that merely mentions the token mid-sentence must
         be delivered — the old substring check wrongly swallowed it."""
         response = "I considered staying [SILENT] but here is the summary: 3 items merged."
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_called_once()
 
     def test_is_cron_silence_response_contract(self):
@@ -2589,36 +2586,36 @@ class TestSilentDelivery:
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         deliver_mock.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output") as save_mock, \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             save_mock.return_value = "/tmp/out.md"
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import tick, _run_one_job_effects
+            _run_one_job_effects(self._make_job(), verbose=False)
 
         deliver_mock.assert_not_called()
         mark_mock.assert_called_once_with(
@@ -2645,25 +2642,23 @@ class TestOneShotDispatchClaim:
 
     def test_claim_runs_before_run_job(self):
         order = []
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
-             patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
+        with patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
              patch("cron.scheduler.run_job", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result"), \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import _run_one_job_effects
+            _run_one_job_effects(self._oneshot(), verbose=False)
         assert order == ["claim", "run"]  # claim strictly before side effect
 
     def test_refused_claim_skips_run_job(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
-             patch("cron.scheduler.claim_dispatch", return_value=False), \
+        with patch("cron.scheduler.claim_dispatch", return_value=False), \
              patch("cron.scheduler.run_job") as run_mock, \
              patch("cron.scheduler.save_job_output"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
-            from cron.scheduler import tick
-            tick(verbose=False)
+            from cron.scheduler import _run_one_job_effects
+            _run_one_job_effects(self._oneshot(), verbose=False)
         run_mock.assert_not_called()
         deliver_mock.assert_not_called()
         mark_mock.assert_not_called()
@@ -3087,112 +3082,125 @@ class TestParallelTick:
             yield
 
     def test_parallel_jobs_run_concurrently(self):
-        """Two jobs launched in the same tick should overlap in time."""
-        import threading
+        """A multi-job tick requests broker admission for every due job in order."""
+        from cron.jobs import DueJob, DueScan
+        from cron.quiescence import DispatchResult
+        from cron.scheduler import tick
 
-        barrier = threading.Barrier(2, timeout=5)
-        call_order = []
+        due = tuple(
+            DueJob(jid, str(index) * 64, f"slot-{index}", f"slot-{index}", {"id": jid}, {})
+            for index, jid in enumerate(("job-a", "job-b"), start=1)
+        )
+        requested = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
-            """Each job hits a barrier — both must be active simultaneously."""
-            call_order.append(("start", job["id"]))
-            barrier.wait()  # blocks until both threads reach here
-            call_order.append(("end", job["id"]))
-            return (True, "output", "response", None)
+        def dispatch(job_id, **kwargs):
+            result = DispatchResult(
+                status="ACCEPTED", job_id=job_id, mode="ticker", request_id=f"req-{job_id}",
+                attempt_token=f"a-{job_id}", run_token=f"r-{job_id}",
+            )
+            requested.append((job_id, kwargs, result))
+            return result
 
-        jobs = [
-            {"id": "job-a", "name": "a", "deliver": "local"},
-            {"id": "job-b", "name": "b", "deliver": "local"},
-        ]
-
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
+        with patch("cron.jobs.scan_due_jobs_read_only", return_value=DueScan("now", due)), \
+             patch("cron.quiescence.request_broker_dispatch", side_effect=dispatch), \
+             patch("cron.scheduler.claim_dispatch") as claim, \
+             patch("cron.scheduler.run_job") as run, \
+             patch("cron.scheduler.mark_job_run") as mark:
             result = tick(verbose=False)
 
         assert result == 2
-        # Both starts happened before both ends — proof of concurrency
-        starts = [i for i, (action, _) in enumerate(call_order) if action == "start"]
-        ends = [i for i, (action, _) in enumerate(call_order) if action == "end"]
-        assert len(starts) == 2
-        assert len(ends) == 2
-        assert max(starts) < min(ends), f"Jobs not concurrent: {call_order}"
+        assert [job_id for job_id, _kwargs, _result in requested] == ["job-a", "job-b"]
+        assert all(item.status.value == "ACCEPTED" for _job, _kw, item in requested)
+        assert all(item.accepted is True and item.retryable is False for _job, _kw, item in requested)
+        assert all(
+            kwargs.get("mode") == "ticker"
+            and set(kwargs) == {"mode", "profile_home"}
+            for _job, kwargs, _item in requested
+        )
+        claim.assert_not_called()
+        run.assert_not_called()
+        mark.assert_not_called()
 
     def test_parallel_jobs_isolated_contextvars(self):
-        """Each job's ContextVars must be isolated — no cross-contamination."""
-        from gateway.session_context import get_session_env
-        seen = {}
+        """Public tick does not enter any per-job execution context locally."""
+        from cron.jobs import DueJob, DueScan
+        from cron.quiescence import DispatchResult
+        from cron.scheduler import tick
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
-            origin = job.get("origin", {})
-            # run_job sets ContextVars — verify each job sees its own
-            from gateway.session_context import set_session_vars, clear_session_vars
-            tokens = set_session_vars(
-                platform=origin.get("platform", ""),
-                chat_id=str(origin.get("chat_id", "")),
+        jobs = (
+            {"id": "tg-job", "origin": {"platform": "telegram", "chat_id": "111"}},
+            {"id": "dc-job", "origin": {"platform": "discord", "chat_id": "222"}},
+        )
+        due = tuple(
+            DueJob(job["id"], str(index) * 64, f"slot-{index}", f"slot-{index}", job, {})
+            for index, job in enumerate(jobs, start=3)
+        )
+        requested = []
+
+        def dispatch(job_id, **kwargs):
+            status = "ACCEPTED" if job_id == "tg-job" else "DEFERRED_QUIESCENCE"
+            result = DispatchResult(
+                status=status, job_id=job_id, mode="ticker", request_id=f"req-{job_id}",
+                attempt_token="a" if status == "ACCEPTED" else None,
+                run_token="r" if status == "ACCEPTED" else None,
             )
-            import time
-            time.sleep(0.05)  # give other thread time to set its vars
-            platform = get_session_env("HERMES_SESSION_PLATFORM")
-            chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-            seen[job["id"]] = {"platform": platform, "chat_id": chat_id}
-            clear_session_vars(tokens)
-            return (True, "output", "response", None)
+            requested.append((job_id, kwargs, result))
+            return result
 
-        jobs = [
-            {"id": "tg-job", "name": "tg", "deliver": "local",
-             "origin": {"platform": "telegram", "chat_id": "111"}},
-            {"id": "dc-job", "name": "dc", "deliver": "local",
-             "origin": {"platform": "discord", "chat_id": "222"}},
+        with patch("cron.jobs.scan_due_jobs_read_only", return_value=DueScan("now", due)), \
+             patch("cron.quiescence.request_broker_dispatch", side_effect=dispatch), \
+             patch("cron.scheduler.claim_dispatch") as claim, \
+             patch("cron.scheduler.run_job") as run, \
+             patch("cron.scheduler.mark_job_run") as mark:
+            result = tick(verbose=False)
+
+        assert result == 1
+        assert [item.status.value for _job, _kw, item in requested] == [
+            "ACCEPTED", "DEFERRED_QUIESCENCE"
         ]
-
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
-
-        assert seen["tg-job"] == {"platform": "telegram", "chat_id": "111"}
-        assert seen["dc-job"] == {"platform": "discord", "chat_id": "222"}
+        assert [(item.accepted, item.retryable) for _job, _kw, item in requested] == [
+            (True, False), (False, True)
+        ]
+        assert [job_id for job_id, _kw, _item in requested] == ["tg-job", "dc-job"]
+        claim.assert_not_called()
+        run.assert_not_called()
+        mark.assert_not_called()
 
     def test_max_parallel_env_var(self, monkeypatch):
-        """HERMES_CRON_MAX_PARALLEL=1 should restore serial behaviour."""
+        """Legacy local-pool config never re-enables public local execution."""
+        from cron.jobs import DueJob, DueScan
+        from cron.quiescence import DispatchResult
+        from cron.scheduler import tick
+
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
-        call_times = []
+        due = tuple(
+            DueJob(jid, str(index) * 64, f"slot-{index}", f"slot-{index}", {"id": jid}, {})
+            for index, jid in enumerate(("s1", "s2"), start=5)
+        )
+        requested = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
-            import time
-            call_times.append(("start", job["id"], time.monotonic()))
-            time.sleep(0.05)
-            call_times.append(("end", job["id"], time.monotonic()))
-            return (True, "output", "response", None)
+        def dispatch(job_id, **kwargs):
+            result = DispatchResult(
+                status="ACCEPTED", job_id=job_id, mode="ticker", request_id=f"req-{job_id}",
+                attempt_token=f"a-{job_id}", run_token=f"r-{job_id}",
+            )
+            requested.append((job_id, kwargs, result))
+            return result
 
-        jobs = [
-            {"id": "s1", "name": "s1", "deliver": "local"},
-            {"id": "s2", "name": "s2", "deliver": "local"},
-        ]
-
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
+        with patch("cron.jobs.scan_due_jobs_read_only", return_value=DueScan("now", due)), \
+             patch("cron.quiescence.request_broker_dispatch", side_effect=dispatch), \
+             patch("cron.scheduler.claim_dispatch") as claim, \
+             patch("cron.scheduler.run_job") as run, \
+             patch("cron.scheduler.mark_job_run") as mark:
             result = tick(verbose=False)
 
         assert result == 2
-        # With max_workers=1, second job starts after first ends
-        end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
-        start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
-        assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+        assert [job_id for job_id, _kwargs, _result in requested] == ["s1", "s2"]
+        assert all(item.status.value == "ACCEPTED" for _job, _kw, item in requested)
+        assert all(item.accepted is True and item.retryable is False for _job, _kw, item in requested)
+        claim.assert_not_called()
+        run.assert_not_called()
+        mark.assert_not_called()
 
 
 class TestDeliverResultTimeoutCancelsFuture:

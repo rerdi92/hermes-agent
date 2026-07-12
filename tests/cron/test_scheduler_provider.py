@@ -21,6 +21,20 @@ import time
 from unittest.mock import patch
 
 
+def _dispatch(status, job_id="j1"):
+    from cron.quiescence import DispatchResult
+
+    return DispatchResult(
+        status=status,
+        job_id=job_id,
+        mode="provider",
+        request_id="req",
+        attempt_token="a" if status in {"ACCEPTED", "COMPLETED"} else None,
+        run_token="r" if status in {"ACCEPTED", "COMPLETED"} else None,
+        run_success=True if status == "COMPLETED" else None,
+    )
+
+
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
 
@@ -331,50 +345,72 @@ def test_builtin_inherits_hook_defaults():
 
 
 def test_fire_due_default_claims_then_runs(monkeypatch):
-    """The default fire_due claims via the store CAS, fetches the job, and runs
-    it through the shared run_one_job body."""
-    import cron.jobs as jobs
-    import cron.scheduler as sched
+    """The provider boundary returns the broker's structured acceptance."""
+    import cron.quiescence as quiescence
     from cron.scheduler_provider import InProcessCronScheduler
 
-    ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
-    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    requested = []
+    monkeypatch.setattr(
+        quiescence,
+        "request_broker_dispatch",
+        lambda job_id, **kw: requested.append((job_id, kw)) or _dispatch("ACCEPTED"),
+    )
+    with patch("cron.jobs.claim_job_for_fire") as claim, \
+         patch("cron.scheduler.run_one_job") as run, \
+         patch("cron.scheduler.mark_job_run") as mark:
+        result = InProcessCronScheduler().fire_due("j1")
 
-    assert InProcessCronScheduler().fire_due("j1") is True
-    assert ran == ["j1"]
+    assert result.status.value == "ACCEPTED"
+    assert result.accepted is True
+    assert result.retryable is False
+    assert requested == [("j1", {"mode": "provider"})]
+    claim.assert_not_called()
+    run.assert_not_called()
+    mark.assert_not_called()
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
-    """If the CAS claim is lost (another machine/retry won), fire_due returns
-    False and never runs the job."""
-    import cron.jobs as jobs
-    import cron.scheduler as sched
+    """Broker dedup is structured and never falls back to local execution."""
+    import cron.quiescence as quiescence
     from cron.scheduler_provider import InProcessCronScheduler
 
-    ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: False, raising=False)
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    monkeypatch.setattr(
+        quiescence, "request_broker_dispatch", lambda *_a, **_k: _dispatch("ALREADY_RUNNING")
+    )
+    with patch("cron.jobs.claim_job_for_fire") as claim, \
+         patch("cron.scheduler.run_one_job") as run, \
+         patch("cron.scheduler.mark_job_run") as mark:
+        result = InProcessCronScheduler().fire_due("j1")
 
-    assert InProcessCronScheduler().fire_due("j1") is False
-    assert ran == []
+    assert result.status.value == "ALREADY_RUNNING"
+    assert result.accepted is False
+    assert result.retryable is False
+    claim.assert_not_called()
+    run.assert_not_called()
+    mark.assert_not_called()
 
 
 def test_fire_due_missing_job_does_not_run(monkeypatch):
-    """If the job vanished between arm and fire (e.g. repeat-N exhausted),
-    fire_due returns False without running."""
-    import cron.jobs as jobs
-    import cron.scheduler as sched
+    """A vanished job is reported by the broker without local fallback."""
+    import cron.quiescence as quiescence
     from cron.scheduler_provider import InProcessCronScheduler
 
-    ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
-    monkeypatch.setattr(jobs, "get_job", lambda jid: None)
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    monkeypatch.setattr(
+        quiescence,
+        "request_broker_dispatch",
+        lambda job_id, **_kw: _dispatch("JOB_NOT_FOUND", job_id=job_id),
+    )
+    with patch("cron.jobs.claim_job_for_fire") as claim, \
+         patch("cron.scheduler.run_one_job") as run, \
+         patch("cron.scheduler.mark_job_run") as mark:
+        result = InProcessCronScheduler().fire_due("gone")
 
-    assert InProcessCronScheduler().fire_due("gone") is False
-    assert ran == []
+    assert result.status.value == "JOB_NOT_FOUND"
+    assert result.accepted is False
+    assert result.retryable is False
+    claim.assert_not_called()
+    run.assert_not_called()
+    mark.assert_not_called()
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──

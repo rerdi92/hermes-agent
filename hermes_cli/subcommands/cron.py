@@ -7,6 +7,7 @@ import ``main`` (cycle avoidance).
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
@@ -159,5 +160,28 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+
+    cron_quiescence = cron_subparsers.add_parser(
+        "quiescence", help="Inspect canonical cron quiescence state"
+    )
+    quiescence_subparsers = cron_quiescence.add_subparsers(
+        dest="quiescence_command", required=True
+    )
+    quiescence_subparsers.add_parser(
+        "inspect", help="Print a read-only token-free broker summary"
+    )
+
+    cron_quiescent_exec = cron_subparsers.add_parser(
+        "quiescent-exec",
+        help="Run an exact child argv while cron admission is quiesced",
+    )
+    cron_quiescent_exec.add_argument("--wait-timeout", type=float, default=300.0)
+    cron_quiescent_exec.add_argument("--child-timeout", type=float, default=600.0)
+    cron_quiescent_exec.add_argument("--expected-argv-sha256", required=True)
+    cron_quiescent_exec.add_argument(
+        "argv",
+        nargs=argparse.REMAINDER,
+        help="Exact argv after --; executable must be absolute",
+    )
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

@@ -20,6 +20,20 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 
+def _dispatch(status="ACCEPTED", job_id="j1"):
+    from cron.quiescence import DispatchResult
+
+    kwargs = {
+        "status": status,
+        "job_id": job_id,
+        "mode": "provider",
+        "request_id": "req",
+    }
+    if status == "ACCEPTED":
+        kwargs.update(attempt_token="a", run_token="r")
+    return DispatchResult(**kwargs)
+
+
 def _client(auth_required: bool):
     prev_auth = getattr(web_server.app.state, "auth_required", None)
     prev_host = getattr(web_server.app.state, "bound_host", None)
@@ -110,7 +124,8 @@ def test_unknown_job_200_gone(monkeypatch):
                            headers={"Authorization": "Bearer good"},
                            json={"job_id": "ghost"})
         assert resp.status_code == 200
-        assert resp.json().get("status") == "gone"
+        assert resp.json().get("status") == "JOB_NOT_FOUND"
+        assert resp.json().get("schema") == "hermes.cron.dispatch-result.v1"
     finally:
         _restore(pa, ph)
         client.close()
@@ -126,7 +141,7 @@ def test_valid_token_accepts_and_fires(monkeypatch):
     )
     monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
     monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
-                        lambda p, j: fired.append((p, j)) or True)
+                        lambda p, j: fired.append((p, j)) or _dispatch(job_id=j))
 
     client, pa, ph = _client(auth_required=False)
     try:
@@ -135,8 +150,10 @@ def test_valid_token_accepts_and_fires(monkeypatch):
                            json={"job_id": "j1"})
         assert resp.status_code == 202
         assert resp.json()["job_id"] == "j1"
+        assert resp.json()["status"] == "ACCEPTED"
+        assert resp.json()["schema"] == "hermes.cron.dispatch-result.v1"
     finally:
         _restore(pa, ph)
         client.close()
-    # background task ran the fire for the resolved profile
+    # broker submission ran off-loop for the resolved profile
     assert fired == [("default", "j1")]

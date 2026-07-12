@@ -19,7 +19,20 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
-    def test_pause_resume_run(self, tmp_cron_dir, capsys):
+    def test_pause_resume_run(self, tmp_cron_dir, capsys, monkeypatch):
+        from cron.quiescence import DispatchResult
+
+        monkeypatch.setattr(
+            "cron.quiescence.request_broker_dispatch",
+            lambda job_id, **kwargs: DispatchResult(
+                status="ACCEPTED",
+                job_id=job_id,
+                mode="immediate",
+                request_id="req",
+                attempt_token="attempt",
+                run_token="run",
+            ),
+        )
         job = create_job(prompt="Check server status", schedule="every 1h")
 
         cron_command(Namespace(cron_command="pause", job_id=job["id"]))
@@ -38,6 +51,8 @@ class TestCronCommandLifecycle:
         assert "Paused job" in out
         assert "Resumed job" in out
         assert "Triggered job" in out
+        assert "Run accepted by the broker; execution is pending or in progress." in out
+        assert "next scheduler tick" not in out
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(

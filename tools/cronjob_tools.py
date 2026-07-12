@@ -602,58 +602,50 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute a cron job immediately, outside the scheduler tick.
-
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
-    at-most-once CAS the scheduler/external-provider fire path uses — so a
-    concurrently-running gateway ticker cannot also fire it (the claim both
-    blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
-    If the claim is lost (another fire is in flight), this is a no-op.
-
-    The actual firing is delegated to ``run_one_job`` — the single shared
-    execute→save→deliver→mark body the ticker and external providers use — so
-    failure delivery, ``[SILENT]`` handling, and live-adapter delivery stay
-    identical across paths and can't drift.
-
-    Returns {"claimed": bool, "success": bool, "error": str|None}.
-    """
+    """Request an immediate run from the canonical broker, never locally."""
     job_id = job["id"]
-    try:
-        from cron.scheduler import run_one_job
+    from cron.quiescence import DispatchStatus, request_broker_dispatch
+    from hermes_constants import get_hermes_home
 
-        # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
-            # claim_job_for_fire returns False for paused/disabled/missing
-            # jobs too — don't mislabel those as "already being fired"
-            # (#60703): that message sends the user chasing a phantom
-            # in-flight run when the job simply isn't runnable.
-            refreshed = get_job(job_id)
-            if refreshed is None:
-                reason = "Job no longer exists; nothing to run."
-            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
-                reason = "Job is paused/disabled; resume it before running."
-            else:
-                reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
-
-        # run_one_job records last_run_at/last_status via mark_job_run (which
-        # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
-        refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
+    result = request_broker_dispatch(
+        job_id, mode="immediate", profile_home=get_hermes_home()
+    )
+    if result.accepted:
+        completed = result.completed
+        success = result.run_success if completed else None
         return {
             "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "completed": completed,
+            "pending": not completed,
+            "success": success,
+            "error": (
+                "Cron job completed unsuccessfully."
+                if completed and success is False
+                else None
+            ),
+            "dispatch_status": result.status.value,
+            "retryable": result.retryable,
         }
 
-    except Exception as e:
-        logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "success": False, "error": str(e)}
+    errors = {
+        DispatchStatus.QUIESCENT_BUSY:
+            "Cron broker is quiescent/busy; retry the immediate run explicitly.",
+        DispatchStatus.BROKER_UNAVAILABLE: "Canonical cron broker unavailable.",
+        DispatchStatus.ALREADY_RUNNING:
+            "Job is already being fired by the scheduler; not run again.",
+        DispatchStatus.JOB_NOT_FOUND: "Job no longer exists; nothing to run.",
+        DispatchStatus.JOB_NOT_RUNNABLE:
+            "Job is paused/disabled; resume it before running.",
+    }
+    return {
+        "claimed": False,
+        "success": False,
+        "error": errors.get(
+            result.status, f"Cron broker dispatch failed: {result.status.value}."
+        ),
+        "dispatch_status": result.status.value,
+        "retryable": result.retryable,
+    }
 
 
 def cronjob(
@@ -844,15 +836,26 @@ def cronjob(
             exec_result = _execute_job_now(job)
             # Re-read so the response reflects the post-run last_run_at/last_status.
             result = _format_job(get_job(job_id) or {"id": job_id})
-            result["executed"] = exec_result.get("claimed", False)
-            result["execution_success"] = exec_result.get("success", False)
-            if not exec_result.get("claimed", False):
+            claimed = bool(exec_result.get("claimed", False))
+            pending = bool(exec_result.get("pending", False))
+            completed = bool(exec_result.get("completed", False))
+            result["executed"] = completed
+            result["execution_pending"] = pending
+            result["execution_success"] = exec_result.get("success")
+            if not claimed:
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
-            return json.dumps({"success": True, "job": result}, indent=2)
+            response_success = claimed if pending else bool(exec_result.get("success"))
+            response = {"success": response_success, "job": result}
+            if exec_result.get("dispatch_status"):
+                response["dispatch_status"] = exec_result["dispatch_status"]
+                response["retryable"] = bool(exec_result.get("retryable"))
+            if not response["success"] and exec_result.get("error"):
+                response["error"] = exec_result["error"]
+            return json.dumps(response, indent=2)
 
         if normalized == "update":
             updates: Dict[str, Any] = {}

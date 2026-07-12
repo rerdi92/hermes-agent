@@ -3394,7 +3394,26 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False):
+    """Reject direct execution; only a broker-reserved worker may run effects."""
+    from cron.quiescence import DispatchResult, DispatchStatus
+
+    return DispatchResult(
+        status=DispatchStatus.BROKER_REQUIRED,
+        job_id=str((job or {}).get("id") or ""),
+        mode="provider",
+        request_id=os.urandom(16).hex(),
+    )
+
+
+def _run_one_job_effects(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    _reserved_attempt: bool = False,
+):
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3417,7 +3436,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # use advance_next_run) and infinite/no-repeat jobs. This lives here in
         # the shared body so BOTH the built-in ticker and the external provider
         # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
+        if not _reserved_attempt and not claim_dispatch(job["id"]):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
@@ -3528,15 +3547,42 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
+        interrupted = _consume_interrupted_flag(job["id"])
+        if _reserved_attempt:
+            from cron.quiescence import RunOutcome
+
+            return RunOutcome(
+                success=bool(success),
+                error=error,
+                delivery_error=delivery_error,
+            )
+        if not interrupted:
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
+        interrupted = _consume_interrupted_flag(job["id"])
+        if _reserved_attempt:
+            from cron.quiescence import RunOutcome
+
+            return RunOutcome(success=False, error=str(e))
+        if not interrupted:
             mark_job_run(job["id"], False, str(e))
         return False
+
+
+def _run_reserved_job_effects(
+    job: dict, *, adapters=None, loop=None, verbose: bool = False
+):
+    """Run effects for a broker-reserved snapshot without jobs-store mutation."""
+    return _run_one_job_effects(
+        job,
+        adapters=adapters,
+        loop=loop,
+        verbose=verbose,
+        _reserved_attempt=True,
+    )
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -3557,7 +3603,13 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    broker=None,
+) -> int:
     """
     Check and run all due jobs.
     
@@ -3572,6 +3624,25 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # Admission, schedule advancement, and execution are owned by the broker.
+    # This caller performs only a read-only due scan and dispatch requests.
+    from cron import jobs as cron_jobs
+    from cron import quiescence
+
+    due_jobs = cron_jobs.scan_due_jobs_read_only().jobs
+    if verbose and not due_jobs:
+        logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+    accepted = 0
+    for due_job in due_jobs:
+        kwargs = {"mode": "ticker"}
+        if broker is not None:
+            kwargs.update({"broker": broker, "due_job": due_job})
+        else:
+            kwargs["profile_home"] = _get_hermes_home()
+        result = quiescence.request_broker_dispatch(due_job.job_id, **kwargs)
+        accepted += int(bool(result))
+    return accepted
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 

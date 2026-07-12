@@ -26,6 +26,7 @@ Wire contract: ``docs/chronos-managed-cron-contract.md``.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import Any, Dict, Optional
@@ -54,6 +55,8 @@ class ChronosCronScheduler(CronScheduler):
         self._armed: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._client = None  # lazily constructed (no network in is_available)
+        self._broker = None
+        self._completed_attempt_keys: set[tuple[str, str]] = set()
 
     # -- identity / availability -----------------------------------------
 
@@ -100,12 +103,13 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- lifecycle --------------------------------------------------------
 
-    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+    def start(self, stop_event, *, adapters=None, loop=None, interval=60, broker=None):
         """Arm all enabled jobs via NAS, then RETURN immediately.
 
         Does NOT block and does NOT spawn a 60s wake (DQ-1) — that is the whole
         point of scale-to-zero. The machine wakes only on a NAS→agent fire.
         """
+        self._broker = broker
         try:
             self.reconcile()
         except Exception as e:
@@ -125,26 +129,27 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- arming -----------------------------------------------------------
 
-    def _arm_one_shot(self, job: Dict[str, Any]) -> None:
-        """Ask NAS to arm exactly one one-shot at the job's next_run_at.
-
-        The agent computes the time; NAS+its scheduler are the dumb executor.
-        Idempotent per (job_id, fire_at) via dedup_key, so re-arming the same
-        fire is a no-op NAS-side.
-        """
+    def _arm_one_shot(
+        self,
+        job: Dict[str, Any],
+        *,
+        fire_at: Optional[str] = None,
+        dedup_key: Optional[str] = None,
+    ) -> None:
+        """Ask NAS to arm one idempotent one-shot for the supplied desired time."""
         job_id = job["id"]
-        fire_at = job.get("next_run_at")
-        if not fire_at:
+        effective_fire_at = fire_at or job.get("next_run_at")
+        if not effective_fire_at:
             return
-        dedup_key = f"{job_id}:{fire_at}"
+        effective_dedup_key = dedup_key or f"{job_id}:{effective_fire_at}"
         self._get_client().provision(
             job_id=job_id,
-            fire_at=fire_at,
+            fire_at=effective_fire_at,
             agent_callback_url=self._callback_url(),
-            dedup_key=dedup_key,
+            dedup_key=effective_dedup_key,
         )
         with self._lock:
-            self._armed[job_id] = fire_at
+            self._armed[job_id] = effective_fire_at
 
     def _cancel(self, job_id: str) -> None:
         try:
@@ -212,24 +217,67 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
-        """Run the due job (claim + run_one_job via the ABC default), then
-        re-arm the NEXT one-shot through NAS.
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None):
+        """Submit to the canonical broker; never re-arm on mere acceptance."""
+        from cron.quiescence import request_broker_dispatch
 
-        Re-arm happens AFTER the run so next_run_at reflects the completed fire.
-        If the job is gone (one-shot completed / repeat-N exhausted), get_job
-        returns None → nothing to re-arm (the schedule naturally stops).
-        """
-        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
-        return ran
+        return request_broker_dispatch(job_id, mode="provider", broker=self._broker)
+
+    def on_dispatch_completed(self, result) -> bool:
+        """Re-arm exactly once, and only after a successful broker completion."""
+        from cron.jobs import get_job
+        from cron.quiescence import DispatchStatus
+
+        if result.status is not DispatchStatus.COMPLETED:
+            return False
+        attempt_token = str(result.attempt_token or "")
+        attempt_identity = str(
+            getattr(result, "attempt_token_sha256", None) or ""
+        )
+        if not attempt_identity and attempt_token:
+            attempt_identity = hashlib.sha256(
+                attempt_token.encode("utf-8")
+            ).hexdigest()
+        if not attempt_identity:
+            return False
+        attempt_key = (str(result.job_id), attempt_identity)
+        with self._lock:
+            if attempt_key in self._completed_attempt_keys:
+                return False
+            self._completed_attempt_keys.add(attempt_key)
+            if len(self._completed_attempt_keys) > 4096:
+                self._completed_attempt_keys.pop()
+        job = get_job(result.job_id)
+        fire_at = getattr(result, "completion_next_run_at", None)
+        if not (
+            job
+            and job.get("enabled")
+            and fire_at
+            and job.get("next_run_at") == fire_at
+            and job.get("state") != "paused"
+        ):
+            return True
+        dedup_key = f"{result.job_id}:completion:{attempt_identity}"
+        try:
+            self._arm_one_shot(
+                job,
+                fire_at=fire_at,
+                dedup_key=dedup_key,
+            )
+            return True
+        except Exception as e:
+            with self._lock:
+                self._completed_attempt_keys.discard(attempt_key)
+            logger.warning(
+                "Chronos failed to re-arm job %s after completed fire: %s",
+                result.job_id,
+                e,
+            )
+            from cron.quiescence import RetryableCompletionHookError
+
+            raise RetryableCompletionHookError(
+                f"Chronos re-arm retry required for {result.job_id}"
+            ) from e
 
 
 def register(ctx) -> None:

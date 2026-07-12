@@ -9,8 +9,11 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import shutil
 import tempfile
 import threading
@@ -218,7 +221,7 @@ def _jobs_lock_file() -> Path:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -239,6 +242,10 @@ def _jobs_lock():
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(
+            _jobs_lock_state, "cross_process_acquired", False
+        ):
+            raise RuntimeError("required cross-process jobs lock is unavailable")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -248,7 +255,9 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_acquired = False
         lock_fd = None
+        lock_acquired = False
         try:
             try:
                 ensure_dirs()
@@ -273,6 +282,7 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            lock_acquired = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
@@ -293,11 +303,18 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    lock_acquired = True
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
+            if require_cross_process and not lock_acquired:
+                if lock_fd is not None:
+                    lock_fd.close()
+                    lock_fd = None
+                raise RuntimeError("required cross-process jobs lock is unavailable")
+            _jobs_lock_state.cross_process_acquired = lock_acquired
             try:
                 yield
             finally:
@@ -313,6 +330,7 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_acquired = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -863,6 +881,34 @@ def load_jobs() -> List[Dict[str, Any]]:
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         return data
 
+    raise RuntimeError(
+        f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
+    )
+
+
+def _load_jobs_read_only() -> List[Dict[str, Any]]:
+    """Read jobs without directory creation, auto-repair, or any save path."""
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    try:
+        raw = jobs_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read cron database: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(raw, strict=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cron database corrupted and unrepairable: {exc}"
+            ) from exc
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        return jobs if isinstance(jobs, list) else []
+    if isinstance(data, list):
+        return data
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
     )
@@ -2108,6 +2154,481 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         save_jobs(raw_jobs)
 
     return due
+
+
+# =============================================================================
+# Canonical broker attempt transactions
+# =============================================================================
+
+
+def _job_sha256(job: Dict[str, Any]) -> str:
+    """Hash one logical job independently of jobs.json formatting/updated_at."""
+    payload = json.dumps(
+        job, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class DueJob:
+    job_id: str
+    observed_job_sha256: str
+    observed_next_run_at: Optional[str]
+    due_slot: Optional[str]
+    normalized_job_copy: Dict[str, Any]
+    proposed_repairs: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DueScan:
+    observed_at: str
+    jobs: Tuple[DueJob, ...]
+
+
+@dataclass(frozen=True)
+class ReservationReceipt:
+    job_id: str
+    attempt_token: str
+    run_token: str
+    mode: str
+    before: Dict[str, Any]
+    after: Dict[str, Any]
+    post_job_sha256: str
+
+
+@dataclass(frozen=True)
+class AttemptReservation:
+    status: str
+    job: Optional[Dict[str, Any]] = None
+    receipt: Optional[ReservationReceipt] = None
+
+    def __bool__(self) -> bool:
+        return self.status == "RESERVED"
+
+
+@dataclass(frozen=True)
+class AttemptMutationOutcome:
+    status: str
+    removed: bool = False
+    next_run_at: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.status in {"ROLLED_BACK", "COMPLETED"}
+
+
+def _coerce_scan_now(now: Optional[datetime]) -> datetime:
+    value = now or _hermes_now()
+    return _ensure_aware(value)
+
+
+def _normalized_scan_copy(raw: Dict[str, Any], now: datetime) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return a non-persisted normalized copy and explicit proposed repairs."""
+    job = copy.deepcopy(raw)
+    repairs: Dict[str, Any] = {}
+    if not isinstance(job.get("schedule"), dict):
+        job["schedule"] = {}
+        repairs["schedule"] = {}
+    for field_name in ("next_run_at", "last_run_at"):
+        value = job.get(field_name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            job.pop(field_name, None)
+            repairs[field_name] = None
+            continue
+        try:
+            datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            job.pop(field_name, None)
+            repairs[field_name] = None
+    if not job.get("next_run_at"):
+        schedule = job.get("schedule") or {}
+        recovered = _recoverable_oneshot_run_at(
+            schedule, now, last_run_at=job.get("last_run_at")
+        )
+        if recovered is None and schedule.get("kind") in {"cron", "interval"}:
+            recovered = compute_next_run(schedule, now.isoformat())
+        if recovered:
+            job["next_run_at"] = recovered
+            repairs["next_run_at"] = recovered
+    return job, repairs
+
+
+def scan_due_jobs_read_only(now: Optional[datetime] = None) -> DueScan:
+    """Read due jobs without saving, claiming, repairing, or filesystem mutation."""
+    observed = _coerce_scan_now(now)
+    due: List[DueJob] = []
+    raw_jobs = copy.deepcopy(_load_jobs_read_only())
+    for raw in raw_jobs:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        job, repairs = _normalized_scan_copy(raw, observed)
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            continue
+        if job.get("run_claim") or job.get("fire_claim"):
+            continue
+        next_run = job.get("next_run_at")
+        try:
+            is_due = bool(
+                next_run
+                and _ensure_aware(datetime.fromisoformat(next_run)) <= observed
+            )
+        except (TypeError, ValueError):
+            is_due = False
+        if not is_due:
+            continue
+        repeat = job.get("repeat") or {}
+        times = repeat.get("times")
+        completed = repeat.get("completed", 0)
+        if times is not None and times > 0 and completed >= times:
+            continue
+        due.append(
+            DueJob(
+                job_id=str(job["id"]),
+                observed_job_sha256=_job_sha256(raw),
+                observed_next_run_at=raw.get("next_run_at"),
+                due_slot=raw.get("next_run_at"),
+                normalized_job_copy=copy.deepcopy(job),
+                proposed_repairs=copy.deepcopy(repairs),
+            )
+        )
+    return DueScan(observed_at=observed.isoformat(), jobs=tuple(due))
+
+
+def scan_job_for_dispatch_read_only(
+    job_id: str, now: Optional[datetime] = None
+) -> Optional[DueJob]:
+    """Return one runnable job snapshot without filesystem mutation."""
+    observed = _coerce_scan_now(now)
+    for raw in _load_jobs_read_only():
+        if not isinstance(raw, dict) or raw.get("id") != job_id:
+            continue
+        if not raw.get("enabled", True) or raw.get("state") == "paused":
+            return None
+        job, repairs = _normalized_scan_copy(raw, observed)
+        return DueJob(
+            job_id=job_id,
+            observed_job_sha256=_job_sha256(raw),
+            observed_next_run_at=raw.get("next_run_at"),
+            due_slot=raw.get("next_run_at"),
+            normalized_job_copy=copy.deepcopy(job),
+            proposed_repairs=copy.deepcopy(repairs),
+        )
+    return None
+
+
+def reserve_job_attempt(
+    job_id: str,
+    attempt_token: str,
+    run_token: str,
+    mode: str,
+    observed_job_sha256: str,
+    owner_identity: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> AttemptReservation:
+    """Atomically bind repairs, repeat count, claims and schedule to one attempt."""
+    if mode not in {"ticker", "provider", "immediate"}:
+        raise ValueError(f"invalid dispatch mode: {mode!r}")
+    if not attempt_token or not run_token:
+        raise ValueError("attempt_token and run_token are required")
+    admitted_at = _coerce_scan_now(now)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for index, raw in enumerate(jobs):
+            if raw.get("id") != job_id:
+                continue
+            if not raw.get("enabled", True) or raw.get("state") == "paused":
+                return AttemptReservation("JOB_NOT_RUNNABLE")
+            if _job_sha256(raw) != observed_job_sha256:
+                return AttemptReservation("STALE_SCAN")
+            if raw.get("run_claim") or raw.get("fire_claim"):
+                return AttemptReservation("ALREADY_RUNNING")
+
+            before = copy.deepcopy(raw)
+            after, _repairs = _normalized_scan_copy(raw, admitted_at)
+            repeat = after.get("repeat")
+            if isinstance(repeat, dict):
+                times = repeat.get("times")
+                completed = int(repeat.get("completed", 0) or 0)
+                if times is not None and times > 0:
+                    if completed >= times:
+                        return AttemptReservation("JOB_NOT_RUNNABLE")
+                    repeat["completed"] = completed + 1
+            claim = {
+                "attempt_token": attempt_token,
+                "run_token": run_token,
+                "at": admitted_at.isoformat(),
+                "mode": mode,
+                "owner": copy.deepcopy(owner_identity),
+            }
+            after["run_claim"] = copy.deepcopy(claim)
+            after["fire_claim"] = copy.deepcopy(claim)
+            if (after.get("schedule") or {}).get("kind") in {"cron", "interval"}:
+                next_run = compute_next_run(after["schedule"], admitted_at.isoformat())
+                if next_run:
+                    after["next_run_at"] = next_run
+            jobs[index] = copy.deepcopy(after)
+            _save_jobs_unlocked(jobs)
+            post_hash = _job_sha256(after)
+            receipt = ReservationReceipt(
+                job_id=job_id,
+                attempt_token=attempt_token,
+                run_token=run_token,
+                mode=mode,
+                before=copy.deepcopy(before),
+                after=copy.deepcopy(after),
+                post_job_sha256=post_hash,
+            )
+            return AttemptReservation(
+                "RESERVED", job=copy.deepcopy(after), receipt=receipt
+            )
+    return AttemptReservation("JOB_NOT_FOUND")
+
+
+def rollback_reserved_attempt(receipt: ReservationReceipt) -> AttemptMutationOutcome:
+    """CAS rollback for submit failure only; never touches a newer attempt."""
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for index, current in enumerate(jobs):
+            if current.get("id") != receipt.job_id:
+                continue
+            claim = current.get("run_claim") or {}
+            matches = (
+                claim.get("attempt_token") == receipt.attempt_token
+                and current == receipt.after
+                and _job_sha256(current) == receipt.post_job_sha256
+            )
+            if not matches:
+                return AttemptMutationOutcome("CAS_MISMATCH")
+            jobs[index] = copy.deepcopy(receipt.before)
+            _save_jobs_unlocked(jobs)
+            return AttemptMutationOutcome("ROLLED_BACK")
+    return AttemptMutationOutcome("CAS_MISMATCH")
+
+
+_COMPLETION_PROOF_SCHEMA = "hermes.cron.attempt-completion-proof.v1"
+_COMPLETION_PROOF_KEYS = frozenset(
+    {
+        "schema",
+        "job_id",
+        "attempt_token_sha256",
+        "run_success",
+        "removed",
+        "next_run_at",
+        "completed_at",
+        "auth_tag",
+    }
+)
+
+
+def _completion_proof_key_path() -> Path:
+    return _current_cron_store().jobs_file.parent / ".completion-proof-key.json"
+
+
+def _completion_proof_path(job_id: str, attempt_hash: str) -> Path:
+    proof_id = hashlib.sha256(
+        json.dumps([job_id, attempt_hash], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _current_cron_store().jobs_file.parent / "completion-proofs" / f"{proof_id}.json"
+
+
+def _atomic_write_private_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), suffix=".tmp", prefix=f".{path.name}."
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(tmp_path, path)
+        _secure_file(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _completion_proof_key(*, create: bool) -> bytes:
+    path = _completion_proof_key_path()
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if set(payload) != {"schema", "key_hex"} or payload.get("schema") != _COMPLETION_PROOF_SCHEMA:
+            raise RuntimeError("invalid completion proof key")
+        key_hex = payload.get("key_hex")
+        if not isinstance(key_hex, str) or re.fullmatch(r"[0-9a-f]{64}", key_hex) is None:
+            raise RuntimeError("invalid completion proof key")
+        return bytes.fromhex(key_hex)
+    if not create:
+        raise RuntimeError("completion proof key is missing")
+    key = secrets.token_bytes(32)
+    _atomic_write_private_json(
+        path, {"schema": _COMPLETION_PROOF_SCHEMA, "key_hex": key.hex()}
+    )
+    return key
+
+
+def _completion_proof_auth(payload: Dict[str, Any], key: bytes) -> str:
+    unsigned = {name: value for name, value in payload.items() if name != "auth_tag"}
+    encoded = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
+
+def _write_completion_proof_unlocked(
+    *,
+    job_id: str,
+    attempt_hash: str,
+    run_success: bool,
+    removed: bool,
+    next_run_at: Optional[str],
+    completed_at: datetime,
+    key: bytes,
+) -> None:
+    payload: Dict[str, Any] = {
+        "schema": _COMPLETION_PROOF_SCHEMA,
+        "job_id": job_id,
+        "attempt_token_sha256": attempt_hash,
+        "run_success": bool(run_success),
+        "removed": bool(removed),
+        "next_run_at": next_run_at,
+        "completed_at": completed_at.isoformat(),
+    }
+    payload["auth_tag"] = _completion_proof_auth(payload, key)
+    path = _completion_proof_path(job_id, attempt_hash)
+    _atomic_write_private_json(path, payload)
+    try:
+        proofs = sorted(
+            path.parent.glob("*.json"), key=lambda item: item.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in proofs[4096:]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def load_completion_proof_read_only(
+    job_id: str, attempt_hash: str
+) -> Optional[Dict[str, Any]]:
+    if type(job_id) is not str or not job_id:
+        return None
+    if type(attempt_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", attempt_hash) is None:
+        return None
+    path = _completion_proof_path(job_id, attempt_hash)
+    if not path.exists():
+        return None
+    try:
+        key = _completion_proof_key(create=False)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            set(payload) != _COMPLETION_PROOF_KEYS
+            or payload.get("schema") != _COMPLETION_PROOF_SCHEMA
+            or payload.get("job_id") != job_id
+            or payload.get("attempt_token_sha256") != attempt_hash
+            or type(payload.get("run_success")) is not bool
+            or type(payload.get("removed")) is not bool
+            or (
+                payload.get("next_run_at") is not None
+                and (
+                    type(payload.get("next_run_at")) is not str
+                    or not payload.get("next_run_at")
+                )
+            )
+            or type(payload.get("completed_at")) is not str
+            or not payload.get("completed_at")
+            or type(payload.get("auth_tag")) is not str
+            or not hmac.compare_digest(
+                payload["auth_tag"], _completion_proof_auth(payload, key)
+            )
+            or path.resolve() != _completion_proof_path(job_id, attempt_hash).resolve()
+        ):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def complete_reserved_attempt(
+    job_id: str,
+    attempt_token: str,
+    *,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> AttemptMutationOutcome:
+    """Commit one matching terminal attempt without a second repeat increment."""
+    completed_at = _coerce_scan_now(now)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for index, current in enumerate(jobs):
+            if current.get("id") != job_id:
+                continue
+            claim = current.get("run_claim") or {}
+            fire_claim = current.get("fire_claim") or {}
+            if (
+                claim.get("attempt_token") != attempt_token
+                or fire_claim.get("attempt_token") != attempt_token
+                or fire_claim.get("run_token") != claim.get("run_token")
+            ):
+                return AttemptMutationOutcome("TOKEN_MISMATCH")
+            attempt_hash = hashlib.sha256(attempt_token.encode("utf-8")).hexdigest()
+            proof_key = _completion_proof_key(create=True)
+            current["last_run_at"] = completed_at.isoformat()
+            current["last_status"] = "ok" if success else "error"
+            current["last_completed_attempt_sha256"] = attempt_hash
+            current["last_error"] = None if success else error
+            current["last_delivery_error"] = delivery_error
+            current["run_claim"] = None
+            current["fire_claim"] = None
+
+            repeat = current.get("repeat") or {}
+            times = repeat.get("times")
+            completed = int(repeat.get("completed", 0) or 0)
+            if times is not None and times > 0 and completed >= times:
+                jobs.pop(index)
+                _save_jobs_unlocked(jobs)
+                _write_completion_proof_unlocked(
+                    job_id=job_id,
+                    attempt_hash=attempt_hash,
+                    run_success=success,
+                    removed=True,
+                    next_run_at=None,
+                    completed_at=completed_at,
+                    key=proof_key,
+                )
+                return AttemptMutationOutcome("COMPLETED", removed=True)
+
+            next_run = compute_next_run(
+                current.get("schedule") or {}, completed_at.isoformat()
+            )
+            current["next_run_at"] = next_run
+            kind = (current.get("schedule") or {}).get("kind")
+            if next_run is None and kind not in {"cron", "interval"}:
+                current["enabled"] = False
+                current["state"] = "completed"
+            elif next_run is None:
+                current["state"] = "error"
+            elif current.get("state") != "paused":
+                current["state"] = "scheduled"
+            jobs[index] = current
+            _save_jobs_unlocked(jobs)
+            _write_completion_proof_unlocked(
+                job_id=job_id,
+                attempt_hash=attempt_hash,
+                run_success=success,
+                removed=False,
+                next_run_at=next_run,
+                completed_at=completed_at,
+                key=proof_key,
+            )
+            return AttemptMutationOutcome("COMPLETED", next_run_at=next_run)
+    return AttemptMutationOutcome("TOKEN_MISMATCH")
 
 
 # Per-run cron output (`cron/output/<job>/<timestamp>.md`) is written once per

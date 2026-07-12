@@ -166,38 +166,167 @@ def test_reconcile_skips_already_armed_same_time(temp_home, chronos, monkeypatch
     assert fake.provisions == []  # already armed at the same time → no re-arm
 
 
-# -- fire_due re-arm ----------------------------------------------------------
+# -- broker fire / completion re-arm -----------------------------------------
 
-def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
+def _dispatch(status, *, run_success=None, job_id="j1", attempt_token="a"):
+    from cron.quiescence import DispatchResult
+
+    return DispatchResult(
+        status=status,
+        job_id=job_id,
+        mode="provider",
+        request_id="req",
+        attempt_token=attempt_token,
+        run_token="r",
+        run_success=run_success,
+        completion_next_run_at="later" if run_success is not None else None,
+    )
+
+
+def test_fire_due_submits_without_rearming(chronos, monkeypatch):
+    import cron.quiescence as q
+
     prov, fake = chronos
-    # super().fire_due runs the job; stub the ABC default to "ran".
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
-    monkeypatch.setattr("cron.jobs.get_job",
-                        lambda jid: {"id": jid, "enabled": True, "next_run_at": "2026-06-18T12:05:00+00:00"})
+    broker = object()
+    prov._broker = broker
+    monkeypatch.setattr(
+        q,
+        "request_broker_dispatch",
+        lambda job_id, **kwargs: _dispatch("ACCEPTED"),
+    )
 
-    assert prov.fire_due("j1") is True
-    assert [p["job_id"] for p in fake.provisions] == ["j1"]
-    assert fake.provisions[0]["fire_at"] == "2026-06-18T12:05:00+00:00"
+    result = prov.fire_due("j1")
+
+    assert result.status.value == "ACCEPTED"
+    assert fake.provisions == []
 
 
-def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
-    """repeat-N exhausted / one-shot completed → mark_job_run deleted the job →
-    get_job None → no re-arm (the schedule stops cleanly)."""
+def test_completed_fire_no_rearm_when_job_gone(chronos, monkeypatch):
+    """repeat-N exhausted / one-shot completed means the schedule stops."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: None)
 
-    assert prov.fire_due("j1") is True
+    assert prov.on_dispatch_completed(_dispatch("COMPLETED", run_success=True)) is True
     assert fake.provisions == []
 
 
-def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
-    """If the run didn't happen (claim lost), don't re-arm."""
+def test_failed_completion_still_rearms_next_schedule(chronos, monkeypatch):
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: False)
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda jid: {"id": jid, "enabled": True, "next_run_at": "later"},
+    )
 
-    assert prov.fire_due("j1") is False
-    assert fake.provisions == []
+    completed = _dispatch("COMPLETED", run_success=False)
+    assert prov.on_dispatch_completed(completed) is True
+    assert prov.on_dispatch_completed(completed) is False
+    assert [item["job_id"] for item in fake.provisions] == ["j1"]
+
+
+def test_completion_dedup_key_includes_job_id(chronos, monkeypatch):
+    prov, fake = chronos
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda jid: {"id": jid, "enabled": True, "next_run_at": "later"},
+    )
+
+    assert prov.on_dispatch_completed(
+        _dispatch("COMPLETED", run_success=True, job_id="j1", attempt_token="same")
+    ) is True
+    assert prov.on_dispatch_completed(
+        _dispatch("COMPLETED", run_success=True, job_id="j2", attempt_token="same")
+    ) is True
+    assert [item["job_id"] for item in fake.provisions] == ["j1", "j2"]
+
+
+def test_rearm_exception_is_retryable_then_deduplicated(chronos, monkeypatch):
+    prov, _fake = chronos
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda jid: {"id": jid, "enabled": True, "next_run_at": "later"},
+    )
+    calls = []
+
+    def transient_failure(job, **kwargs):
+        calls.append((job["id"], kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("SDK failed after external arm")
+
+    monkeypatch.setattr(prov, "_arm_one_shot", transient_failure)
+    completed = _dispatch("COMPLETED", run_success=True)
+    with pytest.raises(RuntimeError, match="Chronos re-arm retry required"):
+        prov.on_dispatch_completed(completed)
+    assert prov.on_dispatch_completed(completed) is True
+    assert prov.on_dispatch_completed(completed) is False
+    assert [item[0] for item in calls] == ["j1", "j1"]
+    assert calls[0][1] == calls[1][1]
+    import hashlib
+
+    assert calls[0][1]["dedup_key"].endswith(hashlib.sha256(b"a").hexdigest())
+
+
+def test_rearm_retry_skips_stale_fire_time_after_job_changes(chronos, monkeypatch):
+    prov, _fake = chronos
+    current = {"id": "j1", "enabled": True, "next_run_at": "later"}
+    monkeypatch.setattr("cron.jobs.get_job", lambda jid: dict(current))
+    calls = []
+
+    def ambiguous_failure(job, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("remote accepted, local response lost")
+
+    monkeypatch.setattr(prov, "_arm_one_shot", ambiguous_failure)
+    completed = _dispatch("COMPLETED", run_success=True)
+    with pytest.raises(RuntimeError, match="Chronos re-arm retry required"):
+        prov.on_dispatch_completed(completed)
+    current["next_run_at"] = "later-2"
+
+    assert prov.on_dispatch_completed(completed) is True
+    assert len(calls) == 1
+
+
+def test_real_completion_rearms_post_cas_fire_time(temp_home, chronos):
+    from datetime import timedelta
+    import hashlib
+
+    from cron import jobs
+    from cron.quiescence import DispatchResult
+
+    prov, fake = chronos
+    job = jobs.create_job(prompt="rearm", schedule="every 1h")
+    stored = jobs.load_jobs()
+    stored[0]["next_run_at"] = (jobs._hermes_now() - timedelta(seconds=1)).isoformat()
+    jobs.save_jobs(stored)
+    due = jobs.scan_due_jobs_read_only(jobs._hermes_now()).jobs[0]
+    reservation = jobs.reserve_job_attempt(
+        job["id"],
+        "attempt-real",
+        "run-real",
+        "provider",
+        due.observed_job_sha256,
+        {"pid": 1},
+        jobs._hermes_now(),
+    )
+    outcome = jobs.complete_reserved_attempt(
+        job["id"],
+        "attempt-real",
+        success=True,
+    )
+    assert reservation.status == "RESERVED"
+    persisted_fire = jobs.get_job(job["id"])["next_run_at"]
+
+    assert outcome.next_run_at == persisted_fire
+    result = DispatchResult(
+        status="COMPLETED",
+        job_id=job["id"],
+        mode="provider",
+        request_id="req-real",
+        attempt_token_sha256=hashlib.sha256(b"attempt-real").hexdigest(),
+        run_success=True,
+        completion_next_run_at=outcome.next_run_at,
+    )
+    assert prov.on_dispatch_completed(result) is True
+    assert fake.provisions[-1]["fire_at"] == persisted_fire
+    assert fake.provisions[-1]["dedup_key"].endswith(
+        hashlib.sha256(b"attempt-real").hexdigest()
+    )

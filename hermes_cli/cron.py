@@ -189,6 +189,50 @@ def cron_tick():
     tick(verbose=True)
 
 
+def cron_quiescent_exec(args) -> int:
+    """Run an exact child argv inside the canonical cron quiescence barrier."""
+    from cron.quiescence import execute_quiescent_child
+    from hermes_constants import get_hermes_home
+
+    argv = list(getattr(args, "argv", ()) or ())
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    try:
+        result = execute_quiescent_child(
+            argv,
+            expected_argv_sha256=args.expected_argv_sha256,
+            profile_home=get_hermes_home(),
+            wait_timeout=float(args.wait_timeout),
+            child_timeout=float(args.child_timeout),
+        )
+    except ValueError as exc:
+        print(f"quiescent-exec rejected: {exc}", file=sys.stderr)
+        return 64
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(
+            result.stderr,
+            file=sys.stderr,
+            end="" if result.stderr.endswith("\n") else "\n",
+        )
+    print(f"quiescent-exec evidence: {result.evidence_path}", file=sys.stderr)
+    return int(result.exit_code)
+
+
+def cron_quiescence_inspect() -> int:
+    """Print a read-only, token-free summary of canonical cron state."""
+    from agent.redact import redact_sensitive_text
+    from cron.quiescence import inspect_quiescence
+    from hermes_constants import get_hermes_home
+
+    rendered = json.dumps(
+        inspect_quiescence(get_hermes_home()), indent=2, sort_keys=True
+    )
+    print(redact_sensitive_text(rendered, force=True))
+    return 0
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -409,6 +453,8 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         if job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
+        elif job.get("execution_pending"):
+            print("  Run accepted by the broker; execution is pending or in progress.")
         elif job.get("execution_skipped"):
             print(f"  {job['execution_skipped']}")
         else:
@@ -433,6 +479,12 @@ def cron_command(args):
         cron_tick()
         return 0
 
+    if subcmd == "quiescent-exec":
+        return cron_quiescent_exec(args)
+
+    if subcmd == "quiescence" and getattr(args, "quiescence_command", None) == "inspect":
+        return cron_quiescence_inspect()
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -452,5 +504,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick|quiescence|quiescent-exec]")
     sys.exit(1)

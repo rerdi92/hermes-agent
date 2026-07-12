@@ -184,7 +184,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run") as mock_mark:
-            result = sched.run_one_job(job)
+            result = sched._run_one_job_effects(job)
 
         assert result is True
         # The would-be "success" write must NOT happen -- the shutdown
@@ -223,7 +223,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
              patch("cron.scheduler.mark_job_run"):
-            result = sched.run_one_job(job)
+            result = sched._run_one_job_effects(job)
 
         assert result is True
         mock_summarize.assert_called_once()
@@ -253,7 +253,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run") as mock_mark:
-            result = sched.run_one_job(job)
+            result = sched._run_one_job_effects(job)
 
         assert result is True
         mock_mark.assert_called_once()
@@ -272,7 +272,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("agent.secret_scope.reset_secret_scope"), \
              patch("cron.scheduler.run_job", side_effect=RuntimeError("boom")), \
              patch("cron.scheduler.mark_job_run") as mock_mark:
-            result = sched.run_one_job(job)
+            result = sched._run_one_job_effects(job)
 
         assert result is False
         mock_mark.assert_not_called()

@@ -56,6 +56,7 @@ class CronScheduler(ABC):
         adapters: Any = None,
         loop: Any = None,
         interval: int = 60,
+        broker: Any = None,
     ) -> None:
         """Begin firing due jobs.
 
@@ -82,27 +83,17 @@ class CronScheduler(ABC):
         Built-in: no-op (it re-reads jobs.json on every tick)."""
         return None
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
-        """Run a single job NOW via the shared orchestrator. Called by the
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None):
+        """Request a single provider dispatch from the canonical broker. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
-        The default claims the job with a store-level compare-and-set
-        (multi-machine at-most-once), then runs it via the shared
-        ``run_one_job`` body. Built-in never calls this (it has its own tick
-        loop); an external provider routes its inbound fire here.
-
-        Returns True if THIS caller claimed and ran the job, False if the claim
-        was lost (another machine/retry won it) or the job no longer exists.
+        This surface deliberately has no claim/run fallback. ``DispatchResult``
+        remains bool-compatible for legacy callers while preserving structured
+        broker status for provider retry handling.
         """
-        from cron.jobs import claim_job_for_fire, get_job
-        from cron.scheduler import run_one_job
+        from cron.quiescence import request_broker_dispatch
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        return run_one_job(job, adapters=adapters, loop=loop)
+        return request_broker_dispatch(job_id, mode="provider")
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -163,7 +154,7 @@ class InProcessCronScheduler(CronScheduler):
     def name(self) -> str:
         return "builtin"
 
-    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+    def start(self, stop_event, *, adapters=None, loop=None, interval=60, broker=None):
         import logging
         from cron.scheduler import tick as cron_tick
         from cron.jobs import record_ticker_heartbeat
@@ -176,7 +167,13 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             try:
-                cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
+                cron_tick(
+                    verbose=False,
+                    adapters=adapters,
+                    loop=loop,
+                    sync=False,
+                    broker=broker,
+                )
                 ok = True
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from

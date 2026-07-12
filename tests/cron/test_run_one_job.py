@@ -10,7 +10,15 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import pytest
+
 import cron.scheduler as s
+
+
+@pytest.fixture(autouse=True)
+def _authorize_execution_body(monkeypatch):
+    """The private effects path is exercised only after broker reservation."""
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -42,16 +50,37 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
 
 
 def test_tick_process_job_sequence(monkeypatch):
-    """Characterization: a single due job driven through tick() runs the
-    sequence run_job → save → deliver → mark, in that order."""
-    calls = _patch_pipeline(monkeypatch)
-    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
-    monkeypatch.setattr(s, "advance_next_run", lambda jid: True)
+    """Public tick admits each due job to the broker and never runs effects."""
+    from cron.jobs import DueJob, DueScan
+    from cron.quiescence import DispatchResult
 
-    s.tick(verbose=False, sync=True)
+    due = DueJob("j1", "a" * 64, "slot", "slot", {"id": "j1"}, {})
+    monkeypatch.setattr(
+        "cron.jobs.scan_due_jobs_read_only", lambda now=None: DueScan("now", (due,))
+    )
+    requested = []
+    monkeypatch.setattr(
+        "cron.quiescence.request_broker_dispatch",
+        lambda job_id, **kw: requested.append((job_id, kw)) or DispatchResult(
+            status="ACCEPTED", job_id=job_id, mode="ticker", request_id="req",
+            attempt_token="a", run_token="r",
+        ),
+    )
+    with pytest.MonkeyPatch.context() as local:
+        claim = local.setattr(s, "claim_dispatch", lambda _job_id: (_ for _ in ()).throw(
+            AssertionError("public tick must not claim locally")
+        ))
+        run = local.setattr(s, "run_job", lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("public tick must not execute locally")
+        ))
+        mark = local.setattr(s, "mark_job_run", lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("public tick must not mark locally")
+        ))
+        assert s.tick(verbose=False, sync=True) == 1
 
-    assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
-    assert calls[-1] == ("mark", "j1", True)
+    assert requested == [
+        ("j1", {"mode": "ticker", "profile_home": s._get_hermes_home()})
+    ]
 
 
 def test_run_one_job_success_sequence(monkeypatch):
@@ -59,7 +88,7 @@ def test_run_one_job_success_sequence(monkeypatch):
     for a successful job."""
     calls = _patch_pipeline(monkeypatch)
 
-    ok = s.run_one_job({"id": "j2", "name": "t"})
+    ok = s._run_one_job_effects({"id": "j2", "name": "t"})
 
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
@@ -71,7 +100,7 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     deliver."""
     calls = _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
 
-    s.run_one_job({"id": "j3", "name": "t"})
+    s._run_one_job_effects({"id": "j3", "name": "t"})
 
     kinds = [c[0] for c in calls]
     assert "run_job" in kinds and "save" in kinds and "mark" in kinds
@@ -82,7 +111,7 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
 
-    s.run_one_job({"id": "j4", "name": "t"})
+    s._run_one_job_effects({"id": "j4", "name": "t"})
 
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j4", False)
@@ -92,7 +121,7 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     """A failed job still delivers (the error notice) and marks not-ok."""
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
 
-    s.run_one_job({"id": "j5", "name": "t"})
+    s._run_one_job_effects({"id": "j5", "name": "t"})
 
     kinds = [c[0] for c in calls]
     assert "deliver" in kinds  # failures always deliver
@@ -113,7 +142,7 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
         lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
     )
 
-    ok = s.run_one_job({"id": "j6", "name": "t"})
+    ok = s._run_one_job_effects({"id": "j6", "name": "t"})
 
     assert ok is False
     assert marks == [("j6", False)]
@@ -150,7 +179,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     ss.set_multiplex_active(True)
     try:
-        ok = s.run_one_job({"id": "j7", "name": "t"})
+        ok = s._run_one_job_effects({"id": "j7", "name": "t"})
     finally:
         ss.set_multiplex_active(False)
 
@@ -198,7 +227,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j8", "name": "t"})
+    ok = s._run_one_job_effects({"id": "j8", "name": "t"})
 
     assert ok is True
     # Delivery must strictly precede agent teardown + stale-client reap.
@@ -231,7 +260,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j9", "name": "t"})
+    ok = s._run_one_job_effects({"id": "j9", "name": "t"})
 
     assert ok is True  # delivery error is recorded, not propagated
     assert order == ["deliver-raise", "agent.close", "cleanup_stale"], order
@@ -267,7 +296,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j10", "name": "t"})
+    ok = s._run_one_job_effects({"id": "j10", "name": "t"})
 
     # save raised → outer handler marks failure and returns False, but the
     # deferred agent was still torn down (no delivery, no leak).

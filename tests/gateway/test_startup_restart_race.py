@@ -250,6 +250,14 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cron_started = False
+    broker_created = False
+    broker_closed = False
+
+    class FakeUnreadyBroker:
+        def close_owner(self):
+            nonlocal broker_closed
+            broker_closed = True
+            return True
 
     class AbortedStartupRunner:
         def __init__(self, config):
@@ -271,6 +279,11 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
         nonlocal cron_started
         cron_started = True
 
+    def create_unready_broker(*args, **kwargs):
+        nonlocal broker_created
+        broker_created = True
+        return FakeUnreadyBroker()
+
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
     monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
@@ -280,6 +293,11 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: None)
     monkeypatch.setattr("gateway.run.GatewayRunner", AbortedStartupRunner)
     monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
+    monkeypatch.setattr(
+        "gateway.run._create_gateway_cron_broker",
+        create_unready_broker,
+        raising=False,
+    )
     monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
 
     with pytest.raises(SystemExit) as exc:
@@ -287,3 +305,5 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
 
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert cron_started is False
+    assert broker_created is True
+    assert broker_closed is True

@@ -10508,30 +10508,17 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_delete_cron_job_sync, job_id, profile)
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
-    """Run ONE due cron job end-to-end for ``profile`` via the resolved
-    scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
-
-    Scope both cron storage and the runtime Hermes home so the job's store,
-    config, credentials, scripts, skills, and output all belong to the selected
-    profile. Runs with no live adapters; delivery falls back to the per-platform
-    send path.
-    """
+def _fire_cron_job_for_profile(profile: str, job_id: str):
+    """Submit one provider-mode request to this profile's canonical broker."""
     _profile_name, home = _cron_profile_home(profile)
-    from cron import jobs as cron_jobs
-    from cron.scheduler_provider import resolve_cron_scheduler
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
+    from cron.quiescence import request_broker_dispatch
 
-    token = set_hermes_home_override(str(home))
-    try:
-        with cron_jobs.use_cron_store(home):
-            provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
-    finally:
-        reset_hermes_home_override(token)
+    return request_broker_dispatch(
+        job_id,
+        mode="provider",
+        profile_home=home,
+        timeout=1.25,
+    )
 
 
 @app.post("/api/cron/fire")
@@ -10580,17 +10567,21 @@ async def cron_fire_webhook(request: Request):
     # I/O per profile) — run it off the event loop like the other cron
     # dashboard endpoints.
     profile = await _run_cron_dashboard_io(_find_cron_job_profile, job_id)
-    if not profile:
-        # Job is gone (cancelled / completed) — nothing to fire. 200 so NAS
-        # does not retry a fire that is intentionally absent.
-        return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
+    from cron.quiescence import DispatchResult, DispatchStatus, dispatch_result_to_http
 
-    # Run in the background; the store CAS claim inside fire_due de-dupes a
-    # NAS/scheduler retry that arrives while this is in flight.
-    asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
-    )
-    return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
+    if not profile:
+        result = DispatchResult(
+            status=DispatchStatus.JOB_NOT_FOUND,
+            job_id=str(job_id),
+            mode="provider",
+            request_id=os.urandom(16).hex(),
+        )
+    else:
+        result = await _run_cron_dashboard_io(
+            _fire_cron_job_for_profile, profile, job_id
+        )
+    mapped = dispatch_result_to_http(result)
+    return JSONResponse(mapped.body, status_code=mapped.status_code)
 
 
 # ---------------------------------------------------------------------------
