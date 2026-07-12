@@ -86,6 +86,47 @@ def test_read_only_scans_do_not_create_missing_profile_tree(store):
     assert cron_dir.exists() is False
 
 
+def test_attempt_lifecycle_follows_context_scoped_profile_store(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    import cron.jobs as jobs
+
+    default_home = tmp_path / "default"
+    profile_home = tmp_path / "profiles" / "coder"
+    default_cron = default_home / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", default_cron)
+    monkeypatch.setattr(jobs, "JOBS_FILE", default_cron / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", default_cron / "output")
+
+    with jobs.use_cron_store(profile_home):
+        _due_job(jobs, job_id="profile-job")
+        due = jobs.scan_due_jobs_read_only(jobs._hermes_now()).jobs[0]
+        reserved = jobs.reserve_job_attempt(
+            "profile-job",
+            "profile-attempt",
+            "profile-run",
+            "provider",
+            due.observed_job_sha256,
+            {"pid": 1},
+            jobs._hermes_now(),
+        )
+        completed = jobs.complete_reserved_attempt(
+            "profile-job", "profile-attempt", success=True
+        )
+        attempt_hash = hashlib.sha256(b"profile-attempt").hexdigest()
+        proof = jobs.load_completion_proof_read_only("profile-job", attempt_hash)
+
+        assert reserved.status == "RESERVED"
+        assert completed.status == "COMPLETED"
+        assert proof is not None
+        assert jobs._current_cron_store().jobs_file == profile_home / "cron" / "jobs.json"
+
+    assert default_cron.exists() is False
+    assert (profile_home / "cron" / "jobs.json").exists()
+    assert (profile_home / "cron" / ".completion-proof-key.json").exists()
+
+
 def test_attempt_reservation_fails_closed_when_os_lock_fails(store, monkeypatch):
     _due_job(store)
     due = store.scan_due_jobs_read_only(store._hermes_now()).jobs[0]
