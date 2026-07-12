@@ -928,7 +928,25 @@ export const zhHant = defineLocale({
     ageHours: hours => `${hours} 小時前`,
     durationSeconds: seconds => `${seconds} 秒`,
     durationMinutes: (minutes, seconds) => `${minutes} 分 ${seconds} 秒`,
-    tokens: value => `${value} 詞元`
+    tokens: value => `${value} 詞元`,
+    progress: '進度',
+    agentTree: '代理樹',
+    heartbeat: '心跳',
+    stale: '可能停滯',
+    live: '即時',
+    interrupted: '已中斷',
+    unknown: '未知',
+    tasksFinished: (finished, total) => `已完成 ${finished}/${total} 個任務`,
+    noProgressApi: '即時進度 API 無法使用。事件串流活動仍會顯示在代理樹中。',
+    progressDisconnected: '由於 Gateway 中斷連線或請求失敗，即時進度暫時無法使用。',
+    phaseStarting: '正在啟動',
+    phaseModel: '模型',
+    phaseTool: '工具',
+    phaseWaitingModel: '等待模型',
+    phaseWaitingPeer: '等待其他代理',
+    phaseQueued: '已排入佇列',
+    apiCalls: count => `${count} 次 API 呼叫`,
+    budget: (used, max) => `預算 ${used}/${max}`
   },
 
   commandCenter: {

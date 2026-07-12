@@ -1155,7 +1155,25 @@ export const zh: Translations = {
     ageHours: hours => `${hours} 小时前`,
     durationSeconds: seconds => `${seconds} 秒`,
     durationMinutes: (minutes, seconds) => `${minutes} 分 ${seconds} 秒`,
-    tokens: value => `${value} 词元`
+    tokens: value => `${value} 词元`,
+    progress: '进度',
+    agentTree: '代理树',
+    heartbeat: '心跳',
+    stale: '可能停滞',
+    live: '实时',
+    interrupted: '已中断',
+    unknown: '未知',
+    tasksFinished: (finished, total) => `已完成 ${finished}/${total} 个任务`,
+    noProgressApi: '实时进度 API 不可用。事件流活动仍显示在代理树中。',
+    progressDisconnected: '由于 Gateway 断开连接或请求失败，实时进度暂时不可用。',
+    phaseStarting: '正在启动',
+    phaseModel: '模型',
+    phaseTool: '工具',
+    phaseWaitingModel: '等待模型',
+    phaseWaitingPeer: '等待其他代理',
+    phaseQueued: '已排队',
+    apiCalls: count => `${count} 次 API 调用`,
+    budget: (used, max) => `预算 ${used}/${max}`
   },
 
   commandCenter: {

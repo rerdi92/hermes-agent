@@ -5,7 +5,9 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
 import queue
+import sys
 import threading
 import time
 
@@ -17,10 +19,19 @@ from tools.process_registry import process_registry, format_process_notification
 
 @pytest.fixture(autouse=True)
 def _clean_state():
+    gateway_server = sys.modules.get("tui_gateway.server")
+    if gateway_server is not None:
+        gateway_server._stop_all_notification_pollers()
+        for sid in list(gateway_server._sessions):
+            gateway_server._close_session_by_id(sid, end_reason="test_cleanup")
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
+    if gateway_server is not None:
+        gateway_server._stop_all_notification_pollers()
+        for sid in list(gateway_server._sessions):
+            gateway_server._close_session_by_id(sid, end_reason="test_cleanup")
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
@@ -223,6 +234,72 @@ def test_completed_records_pruned_to_cap():
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
 
 
+def test_progress_snapshot_is_redacted_and_uses_completed_children_only():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"results": [], "total_duration_seconds": 0.1}
+
+    progress = {
+        "children": [
+            {
+                "task_index": 0,
+                "goal": "CHILD_SECRET_A",
+                "status": "completed",
+                "heartbeat_at": 100.0,
+                "phase": "completed",
+            },
+            {
+                "task_index": 1,
+                "goal": "CHILD_SECRET_B",
+                "status": "running",
+                "heartbeat_at": 105.0,
+                "phase": "tool",
+                "current_tool": "read_file",
+            },
+        ]
+    }
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["CHILD_SECRET_A", "CHILD_SECRET_B"],
+        context="must never leave the registry",
+        toolsets=["file"],
+        role="leaf",
+        model="m",
+        session_key="private-session-key",
+        origin_ui_session_id="ui-owner",
+        runner=runner,
+        progress_fn=lambda: progress,
+        max_async_children=1,
+    )
+
+    snapshot = ad.list_async_delegation_progress(now=110.0, owner_session_ids=["ui-owner"])
+    assert len(snapshot) == 1
+    item = snapshot[0]
+    assert item["delegation_id"] == dispatched["delegation_id"]
+    assert item["total_count"] == 2
+    assert item["completed_count"] == 1
+    assert item["progress_percent"] == 50
+    assert item["heartbeat_at"] == 105.0
+    assert item["heartbeat_age_seconds"] == 5.0
+    active_child = next(child for child in item["children"] if child["task_index"] == 1)
+    assert active_child["current_tool"] == "read_file"
+    assert "context" not in item
+    assert "toolsets" not in item
+    assert "session_key" not in item
+    assert "origin_ui_session_id" not in item
+    assert "parent_session_id" not in item
+    assert "goals" not in item
+    assert "goal" not in item
+    assert all("goal" not in child for child in item["children"])
+    assert "CHILD_SECRET_A" not in json.dumps(item)
+    assert "CHILD_SECRET_B" not in json.dumps(item)
+    assert "progress_fn" not in item
+    assert all("session_id" not in child for child in item["children"])
+    assert ad.list_async_delegation_progress(now=110.0, owner_session_ids=["other-session"]) == []
+    gate.set()
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -243,6 +320,15 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-sess"
+    fake_child.get_activity_summary.return_value = {
+        "last_activity_ts": time.time(),
+        "last_activity_desc": "running child",
+        "current_tool": None,
+        "api_call_count": 1,
+        "budget_used": 1,
+        "budget_max": 10,
+    }
 
     gate = threading.Event()
 
@@ -277,6 +363,14 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
     assert ad.active_count() == 1  # one background batch unit, not finished
+    progress = ad.list_async_delegation_progress(owner_session_ids=["sess"])
+    assert len(progress) == 1
+    assert progress[0]["delegation_id"] == parsed["delegation_id"]
+    assert progress[0]["total_count"] == 1
+    assert progress[0]["finished_count"] == 0
+    assert progress[0]["progress_percent"] == 0
+    assert progress[0]["children"][0]["status"] == "running"
+    assert "session_id" not in progress[0]["children"][0]
 
     gate.set()
     evt = _drain_one()
@@ -675,5 +769,330 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+def test_empty_batch_results_become_unknown_evidence_not_completed_success():
+    ad.dispatch_async_delegation_batch(
+        goals=["first", "second"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        parent_session_id="owner",
+        runner=lambda: {"results": []},
+        progress_fn=lambda: [],
+        max_async_children=1,
+    )
+
+    assert _drain_one() is not None
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert item["status"] == "failed"
+    assert item["completed_count"] == 0
+    assert item["failed_count"] == 2
+    assert [child["status"] for child in item["children"]] == ["unknown", "unknown"]
+
+
+def test_batch_progress_callback_runs_outside_registry_lock():
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    read_finished = threading.Event()
+
+    def slow_progress():
+        callback_entered.set()
+        callback_release.wait(timeout=5)
+        return {"children": []}
+
+    with ad._records_lock:
+        ad._records["deleg-lock"] = {
+            "delegation_id": "deleg-lock",
+            "goals": ["one"],
+            "goal": "one",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "progress_fn": slow_progress,
+        }
+
+    finalizer = threading.Thread(
+        target=ad._finalize_batch,
+        args=("deleg-lock", {"results": [{"task_index": 0, "status": "completed"}]}, "completed"),
+    )
+    finalizer.start()
+    assert callback_entered.wait(timeout=2)
+
+    reader = threading.Thread(target=lambda: (ad.active_count(), read_finished.set()))
+    reader.start()
+    assert read_finished.wait(timeout=0.5), "registry read blocked behind external progress callback"
+
+    callback_release.set()
+    finalizer.join(timeout=2)
+    reader.join(timeout=2)
+
+
+def test_completed_progress_records_expire_by_monotonic_age(monkeypatch):
+    monkeypatch.setattr(ad, "_COMPLETED_RECORD_TTL_SECONDS", 10.0)
+    with ad._records_lock:
+        ad._records["deleg-old"] = {
+            "delegation_id": "deleg-old",
+            "goal": "old",
+            "goals": ["old"],
+            "session_key": "owner",
+            "status": "completed",
+            "dispatched_at": 1.0,
+            "completed_at": 2.0,
+            "completed_monotonic": 5.0,
+            "final_progress": {"children": [{"task_index": 0, "status": "completed"}]},
+        }
+
+    assert ad.list_async_delegation_progress(
+        owner_session_ids=["owner"], now=20.0, monotonic_now=20.0
+    ) == []
+    assert ad.list_async_delegations() == []
+
+
+def test_progress_payload_has_hard_string_child_and_byte_bounds():
+    children = [
+        {
+            "task_index": index,
+            "subagent_id": "s" * 1_000,
+            "goal": "g" * 10_000,
+            "status": "running",
+            "phase": "tool",
+            "current_tool": "t" * 10_000,
+        }
+        for index in range(200)
+    ]
+    children[0].update(
+        {
+            "heartbeat_at": object(),
+            "api_calls": 10**10_000,
+            "budget_used": float("nan"),
+            "budget_max": float("inf"),
+        }
+    )
+    with ad._records_lock:
+        for record_index in range(20):
+            delegation_id = f"deleg-big-{record_index}"
+            ad._records[delegation_id] = {
+                "delegation_id": delegation_id,
+                "goal": "r" * 10_000,
+                "goals": ["x"] * 200,
+                "session_key": "owner",
+                "status": "running",
+                "dispatched_at": time.time(),
+                "progress_fn": lambda: {"children": children},
+            }
+
+    payload = ad.list_async_delegation_progress(owner_session_ids=["owner"])
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    envelope = {
+        "id": "delegation-progress",
+        "result": {
+            "delegations": payload,
+            "process_instance_id": "f" * 32,
+            "process_local": True,
+            "schema_version": 1,
+            "snapshot_at": time.time(),
+        },
+    }
+    envelope_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= ad._MAX_PROGRESS_DELEGATIONS_BYTES
+    assert len(envelope_bytes) <= ad._MAX_PROGRESS_RESPONSE_BYTES
+    assert len(payload[0]["children"]) <= ad._MAX_PROGRESS_CHILDREN
+    assert "goal" not in payload[0]
+    assert all("goal" not in child for child in payload[0]["children"])
+    assert "r" * 161 not in encoded.decode("utf-8")
+    assert all("subagent_id" not in child and "duration_seconds" not in child for child in payload[0]["children"])
+    assert all(key not in payload[0] for key in ("role", "model", "is_batch", "dispatched_at", "completed_at"))
+
+
+def test_progress_counts_all_children_even_when_export_list_is_capped():
+    children = [
+        {"task_index": index, "goal": f"g{index}", "status": "completed", "phase": "completed"}
+        for index in range(50)
+    ]
+    with ad._records_lock:
+        ad._records["deleg-fifty"] = {
+            "delegation_id": "deleg-fifty",
+            "goal": "fifty",
+            "goals": [f"g{index}" for index in range(50)],
+            "session_key": "owner",
+            "status": "completed",
+            "dispatched_at": time.time(),
+            "completed_at": time.time(),
+            "completed_monotonic": time.monotonic(),
+            "final_progress": {"children": children},
+        }
+
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert len(item["children"]) == ad._MAX_PROGRESS_CHILDREN
+    assert item["total_count"] == 50
+    assert item["finished_count"] == 50
+    assert item["completed_count"] == 50
+    assert item["progress_percent"] == 100
+
+
+def test_single_completion_publishes_one_child_of_evidence():
+    dispatched = ad.dispatch_async_delegation(
+        goal="single",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        parent_session_id="owner",
+        runner=lambda: {"status": "completed", "summary": "done"},
+        max_async_children=1,
+    )
+    assert dispatched["status"] == "dispatched"
+    assert _drain_one() is not None
+
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert item["status"] == "completed"
+    assert item["finished_count"] == 1
+    assert item["completed_count"] == 1
+    assert item["progress_percent"] == 100
+
+
+def test_running_progress_records_sort_before_completed_tail():
+    now = time.time()
+    with ad._records_lock:
+        ad._records["deleg-old"] = {
+            "delegation_id": "deleg-old",
+            "goal": "old",
+            "session_key": "owner",
+            "status": "completed",
+            "dispatched_at": now - 10,
+            "completed_at": now - 5,
+            "completed_monotonic": time.monotonic(),
+            "final_progress": {"children": [{"task_index": 0, "status": "completed"}]},
+        }
+        ad._records["deleg-live"] = {
+            "delegation_id": "deleg-live",
+            "goal": "live",
+            "session_key": "owner",
+            "status": "running",
+            "dispatched_at": now,
+        }
+
+    payload = ad.list_async_delegation_progress(owner_session_ids=["owner"])
+    assert [item["delegation_id"] for item in payload[:2]] == ["deleg-live", "deleg-old"]
+
+
+def test_export_cap_prioritizes_running_children():
+    children = [
+        {
+            "task_index": index,
+            "status": "completed" if index < 32 else "running",
+            "phase": "completed" if index < 32 else "tool",
+        }
+        for index in range(40)
+    ]
+    with ad._records_lock:
+        ad._records["deleg-cap"] = {
+            "delegation_id": "deleg-cap",
+            "goals": [f"g{index}" for index in range(40)],
+            "session_key": "owner",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "progress_fn": lambda: {"children": children},
+        }
+
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert item["running_count"] == 8
+    assert sum(child["status"] == "running" for child in item["children"]) == 8
+
+
+def test_finalize_batch_reconciles_running_callback_with_terminal_result():
+    with ad._records_lock:
+        ad._records["deleg-reconcile"] = {
+            "delegation_id": "deleg-reconcile",
+            "goals": ["secret"],
+            "session_key": "owner",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "progress_fn": lambda: {
+                "children": [{"task_index": 0, "status": "running", "phase": "tool"}]
+            },
+        }
+
+    ad._finalize_batch(
+        "deleg-reconcile",
+        {"results": [{"task_index": 0, "status": "completed"}]},
+        "completed",
+    )
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert item["status"] == "completed"
+    assert item["finished_count"] == 1
+    assert item["completed_count"] == 1
+    assert item["running_count"] == 0
+    assert item["progress_percent"] == 100
+    assert item["children"][0]["status"] == "completed"
+
+
+def test_running_root_does_not_count_malformed_unknown_child_as_finished():
+    with ad._records_lock:
+        ad._records["deleg-malformed-running"] = {
+            "delegation_id": "deleg-malformed-running",
+            "goals": ["secret"],
+            "session_key": "owner",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "progress_fn": lambda: {"children": [{"task_index": 0, "phase": "running"}]},
+        }
+
+    item = ad.list_async_delegation_progress(owner_session_ids=["owner"])[0]
+    assert item["status"] == "running"
+    assert item["finished_count"] == 0
+    assert item["failed_count"] == 0
+    assert item["running_count"] == 1
+    assert item["progress_percent"] == 0
+
+
+def test_progress_read_revalidates_record_after_callback_race():
+    entered = threading.Event()
+    release = threading.Event()
+    holder = {}
+
+    def progress_fn():
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"children": [{"task_index": 0, "status": "running"}]}
+
+    with ad._records_lock:
+        record = {
+            "delegation_id": "deleg-race",
+            "goals": ["secret"],
+            "session_key": "owner",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "progress_fn": progress_fn,
+        }
+        ad._records["deleg-race"] = record
+
+    reader = threading.Thread(
+        target=lambda: holder.setdefault(
+            "payload", ad.list_async_delegation_progress(owner_session_ids=["owner"])
+        )
+    )
+    reader.start()
+    assert entered.wait(timeout=2)
+    with ad._records_lock:
+        record["status"] = "completed"
+        record["completed_at"] = time.time()
+        record["completed_monotonic"] = time.monotonic()
+        record["progress_fn"] = None
+        record["final_progress"] = {
+            "children": [{"task_index": 0, "status": "completed", "phase": "completed"}]
+        }
+    release.set()
+    reader.join(timeout=2)
+
+    assert not reader.is_alive()
+    item = holder["payload"][0]
+    assert item["status"] == "completed"
+    assert item["finished_count"] == 1
+    assert item["completed_count"] == 1
+    assert item["progress_percent"] == 100
 
 

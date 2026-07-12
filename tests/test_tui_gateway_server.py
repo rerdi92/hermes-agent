@@ -481,6 +481,69 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+def test_delegation_progress_combines_live_children_and_async_batches(monkeypatch):
+    import tools.async_delegation as async_mod
+
+    observed = []
+    monkeypatch.setitem(
+        server._sessions,
+        "owner-ui",
+        {
+            "agent": types.SimpleNamespace(session_id="stored-parent"),
+            "session_key": "durable-owner",
+        },
+    )
+    monkeypatch.setattr(
+        async_mod,
+        "list_async_delegation_progress",
+        lambda *, owner_session_ids: observed.append(owner_session_ids) or [{"delegation_id": "deleg-1"}],
+    )
+    monkeypatch.setattr(server.time, "time", lambda: 123.5)
+
+    resp = server.dispatch(
+        {"id": "delegation-progress", "method": "delegation.progress", "params": {"session_id": "owner-ui"}}
+    )
+
+    assert resp["result"] == {
+        "delegations": [{"delegation_id": "deleg-1"}],
+        "process_instance_id": server._GATEWAY_PROCESS_INSTANCE_ID,
+        "process_local": True,
+        "schema_version": 1,
+        "snapshot_at": 123.5,
+    }
+    assert observed == [["owner-ui", "durable-owner", "stored-parent"]]
+
+
+def test_delegation_progress_rejects_non_live_session_id():
+    resp = server.dispatch(
+        {"id": "delegation-progress", "method": "delegation.progress", "params": {"session_id": "not-live"}}
+    )
+
+    assert resp["error"]["code"] == 4001
+
+
+def test_delegation_progress_requires_session_id():
+    resp = server.dispatch({"id": "delegation-progress", "method": "delegation.progress", "params": {}})
+
+    assert resp["error"]["code"] == 4000
+
+
+def test_delegation_status_keeps_legacy_control_shape(monkeypatch):
+    import tools.delegate_tool as delegate_mod
+
+    monkeypatch.setattr(delegate_mod, "list_active_subagents", lambda: [{"subagent_id": "sa-1"}])
+    monkeypatch.setattr(delegate_mod, "is_spawn_paused", lambda: False)
+
+    resp = server.dispatch({"id": "delegation-status", "method": "delegation.status", "params": {}})
+
+    assert resp["result"] == {
+        "active": [{"subagent_id": "sa-1"}],
+        "paused": False,
+        "max_spawn_depth": delegate_mod._get_max_spawn_depth(),
+        "max_concurrent_children": delegate_mod._get_max_concurrent_children(),
+    }
+
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -1938,6 +2001,27 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     server._finalize_session(session)
     server._teardown_session(session)
     assert closed["count"] == 1
+
+
+def test_finalize_session_stops_and_joins_notification_poller(monkeypatch):
+    joined = []
+    stop = threading.Event()
+
+    class _FakeThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            joined.append(timeout)
+
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    session = _session(_notif_stop=stop, _notif_thread=_FakeThread())
+
+    server._finalize_session(session)
+
+    assert stop.is_set()
+    assert joined == [1.0]
 
 
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):

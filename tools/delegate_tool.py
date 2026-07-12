@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 import os
@@ -149,6 +150,137 @@ _active_subagents_lock = threading.Lock()
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
 
+def _safe_activity_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+class _DelegationProgressTracker:
+    """Thread-safe child lifecycle snapshot for async delegation UI status.
+
+    The tracker exposes only bounded operational metadata. Raw activity
+    descriptions, prompts, tool arguments, results, and context never enter the
+    snapshot.
+    """
+
+    _TERMINAL = frozenset({"completed", "failed", "interrupted", "unknown"})
+
+    @staticmethod
+    def _terminal_status(value: Any) -> str:
+        status = str(value or "").strip().lower()
+        if status in {"completed", "success"}:
+            return "completed"
+        if status in {"failed", "error", "timeout", "timed_out"}:
+            return "failed"
+        if status in {"interrupted", "cancelled", "canceled"}:
+            return "interrupted"
+        return "unknown"
+
+    def __init__(self, children, *, now_fn=time.time):
+        self._lock = threading.Lock()
+        self._now_fn = now_fn
+        now = float(now_fn())
+        self._children = {
+            int(index): {
+                "task_index": int(index),
+                "subagent_id": str(getattr(child, "_subagent_id", "") or ""),
+                "goal": str(task.get("goal") or ""),
+                "status": "queued",
+                "phase": "queued",
+                "heartbeat_at": now,
+                "duration_seconds": None,
+                "agent": child,
+            }
+            for index, task, child in children
+        }
+
+    def mark_running(self, task_index: int) -> None:
+        with self._lock:
+            item = self._children.get(int(task_index))
+            if item is not None:
+                item["status"] = "running"
+                item["phase"] = "starting"
+                item["heartbeat_at"] = float(self._now_fn())
+
+    def mark_terminal(self, task_index: int, result: Dict[str, Any]) -> None:
+        status = self._terminal_status(result.get("status"))
+        with self._lock:
+            item = self._children.get(int(task_index))
+            if item is not None:
+                item["status"] = status
+                item["phase"] = status
+                item["heartbeat_at"] = float(self._now_fn())
+                item["duration_seconds"] = result.get("duration_seconds")
+
+    @staticmethod
+    def _phase(status: str, activity: Dict[str, Any]) -> str:
+        if status in _DelegationProgressTracker._TERMINAL:
+            return status
+        current_tool = activity.get("current_tool")
+        if isinstance(current_tool, str) and current_tool.strip():
+            return "tool"
+        desc = str(activity.get("last_activity_desc") or "").lower()
+        if "waiting" in desc or "stream response" in desc:
+            return "waiting_model"
+        api_call_count = _safe_activity_number(activity.get("api_call_count"))
+        if api_call_count is not None and api_call_count > 0:
+            return "model"
+        return "starting" if status == "running" else "queued"
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = float(self._now_fn())
+        with self._lock:
+            state = [dict(item) for _, item in sorted(self._children.items())]
+
+        children: List[Dict[str, Any]] = []
+        for item in state:
+            agent = item.pop("agent", None)
+            activity: Dict[str, Any] = {}
+            if item["status"] not in self._TERMINAL and agent is not None:
+                summary_fn = getattr(agent, "get_activity_summary", None)
+                if callable(summary_fn):
+                    try:
+                        activity = summary_fn() or {}
+                    except Exception:
+                        activity = {}
+            if not isinstance(activity, dict):
+                activity = {}
+
+            heartbeat = _safe_activity_number(activity.get("last_activity_ts"))
+            if heartbeat is not None:
+                item["heartbeat_at"] = heartbeat
+            item["heartbeat_age_seconds"] = round(
+                max(0.0, now - float(item["heartbeat_at"])), 1
+            )
+            item["phase"] = self._phase(str(item["status"]), activity)
+            current_tool = activity.get("current_tool")
+            if isinstance(current_tool, str) and current_tool.strip():
+                item["current_tool"] = current_tool[:80]
+            else:
+                item.pop("current_tool", None)
+            for source, target in (
+                ("api_call_count", "api_calls"),
+                ("budget_used", "budget_used"),
+                ("budget_max", "budget_max"),
+            ):
+                value = _safe_activity_number(activity.get(source))
+                if value is not None:
+                    item[target] = value
+                else:
+                    item.pop(target, None)
+            if not item.get("current_tool"):
+                item.pop("current_tool", None)
+            if item.get("duration_seconds") is None:
+                item.pop("duration_seconds", None)
+            children.append(item)
+        return {"children": children}
+
+
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock new delegate_task spawns.
 
@@ -202,17 +334,56 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
-    """Snapshot of the currently running subagent tree.
+def list_active_subagents(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Snapshot the currently running child tree with sanitized liveness data.
 
-    Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
+    Agent objects and raw activity descriptions never leave the registry. The
+    activity summary is read after releasing the registry lock so a slow or
+    unusual child implementation cannot stall lifecycle mutations.
     """
+    observed_at = time.time() if now is None else float(now)
     with _active_subagents_lock:
-        return [
-            {k: v for k, v in r.items() if k != "agent"}
-            for r in _active_subagents.values()
-        ]
+        records = [dict(record) for record in _active_subagents.values()]
+
+    snapshots: List[Dict[str, Any]] = []
+    for record in records:
+        agent = record.pop("agent", None)
+        activity: Dict[str, Any] = {}
+        summary_fn = getattr(agent, "get_activity_summary", None)
+        if callable(summary_fn):
+            try:
+                activity = summary_fn() or {}
+            except Exception:
+                activity = {}
+        if not isinstance(activity, dict):
+            activity = {}
+        heartbeat = _safe_activity_number(activity.get("last_activity_ts"))
+        if heartbeat is None:
+            heartbeat = _safe_activity_number(record.get("started_at")) or observed_at
+        record["heartbeat_at"] = heartbeat
+        record["heartbeat_age_seconds"] = round(
+            max(0.0, observed_at - heartbeat), 1
+        )
+        record["phase"] = _DelegationProgressTracker._phase(
+            str(record.get("status") or "running"), activity
+        )
+        current_tool = activity.get("current_tool")
+        if isinstance(current_tool, str) and current_tool.strip():
+            record["current_tool"] = current_tool[:80]
+        else:
+            record.pop("current_tool", None)
+        for source, target in (
+            ("api_call_count", "api_calls"),
+            ("budget_used", "budget_used"),
+            ("budget_max", "budget_max"),
+        ):
+            value = _safe_activity_number(activity.get(source))
+            if value is not None:
+                record[target] = value
+            else:
+                record.pop(target, None)
+        snapshots.append(record)
+    return snapshots
 
 
 def _extract_output_tail(
@@ -2540,6 +2711,18 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    _progress_tracker = _DelegationProgressTracker(children)
+
+    def _run_child_tracked(task_index: int, task: Dict[str, Any], child) -> Dict[str, Any]:
+        _progress_tracker.mark_running(task_index)
+        try:
+            result = _run_single_child(task_index, task["goal"], child, parent_agent)
+        except Exception:
+            _progress_tracker.mark_terminal(task_index, {"status": "error"})
+            raise
+        _progress_tracker.mark_terminal(task_index, result)
+        return result
+
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
@@ -2553,7 +2736,7 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_child_tracked(_i, _t, child)
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2567,13 +2750,7 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
-                    )
+                    future = executor.submit(_run_child_tracked, i, t, child)
                     futures[future] = i
 
                 # Poll futures with interrupt checking.  as_completed() blocks
@@ -2888,6 +3065,7 @@ def delegate_task(
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
+            progress_fn=_progress_tracker.snapshot,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
         )

@@ -36,7 +36,9 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -72,6 +74,66 @@ _records: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+_COMPLETED_RECORD_TTL_SECONDS = 900.0
+_PROGRESS_HEARTBEAT_STALE_SECONDS = 75.0
+_MAX_PROGRESS_CHILDREN = 32
+_MAX_PROGRESS_TEXT_CHARS = 160
+_MAX_PROGRESS_RESPONSE_BYTES = 60_000
+_MAX_PROGRESS_DELEGATIONS_BYTES = 58_000
+_PROGRESS_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "error", "interrupted", "unknown"}
+)
+_PROGRESS_CHILD_KEYS = frozenset(
+    {
+        "task_index",
+        "status",
+        "phase",
+        "heartbeat_at",
+        "heartbeat_age_seconds",
+        "current_tool",
+        "api_calls",
+        "budget_used",
+        "budget_max",
+    }
+)
+
+
+def _normalize_progress_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"completed", "success"}:
+        return "completed"
+    if status in {"failed", "error", "timeout", "timed_out"}:
+        return "failed"
+    if status in {"interrupted", "cancelled", "canceled"}:
+        return "interrupted"
+    if status in {"queued", "running"}:
+        return status
+    return "unknown"
+
+
+def _progress_text(value: Any, limit: int = _MAX_PROGRESS_TEXT_CHARS) -> str:
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)] + "…"
+
+
+def _progress_index(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return parsed if parsed >= 0 else fallback
+
+
+def _progress_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -103,11 +165,23 @@ def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
 
-def _prune_completed_locked() -> None:
-    """Drop the oldest completed records beyond the retention cap.
+def _prune_completed_locked(monotonic_now: Optional[float] = None) -> None:
+    """Drop expired completed records, then enforce the retention count cap.
 
-    Caller must hold ``_records_lock``.
+    Caller must hold ``_records_lock``. A monotonic completion stamp prevents
+    wall-clock jumps from extending or prematurely ending the retention tail.
     """
+    observed = time.monotonic() if monotonic_now is None else float(monotonic_now)
+    expired = [
+        rid
+        for rid, record in _records.items()
+        if record.get("status") != "running"
+        and isinstance(record.get("completed_monotonic"), (int, float))
+        and observed - float(record["completed_monotonic"]) > _COMPLETED_RECORD_TTL_SECONDS
+    ]
+    for rid in expired:
+        _records.pop(rid, None)
+
     completed = [
         (rid, r)
         for rid, r in _records.items()
@@ -254,6 +328,18 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             return
         record["status"] = status
         record["completed_at"] = time.time()
+        record["completed_monotonic"] = time.monotonic()
+        child_status = _normalize_progress_status(result.get("status") or status)
+        record["final_progress"] = {
+            "children": [
+                {
+                    "task_index": 0,
+                    "goal": record.get("goal") or "",
+                    "status": child_status,
+                    "phase": child_status,
+                }
+            ]
+        }
         record["interrupt_fn"] = None  # drop the closure; child is done
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
@@ -329,6 +415,7 @@ def dispatch_async_delegation_batch(
     session_key: str,
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
+    progress_fn: Optional[Callable[[], Dict[str, Any]]] = None,
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
@@ -375,6 +462,7 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "progress_fn": progress_fn,
         "is_batch": True,
     }
     with _records_lock:
@@ -400,15 +488,17 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
-            if child_results and all(
-                (r.get("status") not in ("completed", "success"))
-                for r in child_results
-            ):
-                status = "error"
-            else:
-                status = "completed"
+            status = (
+                "completed"
+                if len(child_results) == n
+                and all(
+                    isinstance(item, dict)
+                    and _normalize_progress_status(item.get("status")) == "completed"
+                    for item in child_results
+                )
+                else "error"
+            )
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
@@ -441,14 +531,67 @@ def dispatch_async_delegation_batch(
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
-    """Mark a batch record complete and push ONE combined completion event."""
+    """Mark a batch record complete and push ONE combined completion event.
+
+    The external progress callback is snapshotted under the registry lock but
+    invoked outside it. Final state is committed only after reacquiring the
+    lock and confirming the same still-running record remains registered.
+    """
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
             return
+        record_ref = record
+        progress_fn = record.get("progress_fn")
+        goals = list(record.get("goals") or [])
+
+    if callable(progress_fn):
+        try:
+            final_progress = progress_fn() or {}
+        except Exception:
+            logger.debug("Async delegation final progress callback failed", exc_info=True)
+            final_progress = {}
+    else:
+        final_progress = {}
+
+    if not isinstance(final_progress, dict):
+        final_progress = {}
+    raw_children = final_progress.get("children")
+    by_index = {
+        _progress_index(item.get("task_index"), index): dict(item)
+        for index, item in enumerate(raw_children if isinstance(raw_children, list) else [])
+        if isinstance(item, dict)
+    }
+    result_by_index = {
+        _progress_index(item.get("task_index"), index): item
+        for index, item in enumerate(combined.get("results") or [])
+        if isinstance(item, dict)
+    }
+    children = []
+    for index, goal in enumerate(goals):
+        child = by_index.get(index) or {"task_index": index, "goal": goal}
+        result = result_by_index.get(index)
+        if result is not None:
+            child_status = _normalize_progress_status(result.get("status"))
+        elif str(child.get("status") or "") in {"queued", "running", ""}:
+            child_status = "unknown"
+        else:
+            child_status = _normalize_progress_status(child.get("status"))
+        child["status"] = child_status
+        child["phase"] = child_status
+        children.append(child)
+    final_progress = {"children": children}
+
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not record_ref or record.get("status") != "running":
+            return
         record["status"] = status
         record["completed_at"] = time.time()
+        record["completed_monotonic"] = time.monotonic()
+        record["final_progress"] = final_progress
         record["interrupt_fn"] = None
+        record["progress_fn"] = None
         event_record = dict(record)
         _prune_completed_locked()
 
@@ -499,13 +642,184 @@ def _finalize_batch(
 def list_async_delegations() -> List[Dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed).
 
-    Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
+    Safe to call from any thread. Excludes non-serialisable callbacks.
     """
     with _records_lock:
+        _prune_completed_locked()
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            {k: v for k, v in r.items() if k not in {"interrupt_fn", "progress_fn"}}
             for r in _records.values()
         ]
+
+
+def list_async_delegation_progress(
+    *,
+    owner_session_ids: List[str],
+    now: Optional[float] = None,
+    monotonic_now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Return a bounded, serialisable, redacted progress snapshot for UI use.
+
+    Dispatch context, toolset metadata, routing keys, callbacks, and interrupt
+    closures never leave this process-local registry. Progress is based only on
+    terminal child counts; iteration budgets remain separate telemetry.
+    """
+    owners = {
+        str(value or "").strip()
+        for value in owner_session_ids
+        if str(value or "").strip()
+    }
+    if not owners:
+        return []
+    observed_at = time.time() if now is None else float(now)
+    with _records_lock:
+        _prune_completed_locked(monotonic_now)
+        records = [
+            (record, dict(record))
+            for record in _records.values()
+            if owners.intersection(
+                {
+                    str(record.get("origin_ui_session_id") or ""),
+                    str(record.get("parent_session_id") or ""),
+                    str(record.get("session_key") or ""),
+                }
+            )
+        ]
+    records.sort(
+        key=lambda item: (
+            item[1].get("status") != "running",
+            -float(item[1].get("completed_at") or item[1].get("dispatched_at") or 0.0),
+        )
+    )
+
+    snapshots: List[Dict[str, Any]] = []
+    for record_ref, record in records:
+        progress_fn = record.get("progress_fn")
+        if callable(progress_fn):
+            try:
+                progress = progress_fn() or {}
+            except Exception:
+                logger.debug("Async delegation progress callback failed", exc_info=True)
+                progress = {}
+            with _records_lock:
+                current = _records.get(record.get("delegation_id"))
+                if current is not record_ref:
+                    continue
+                if (
+                    current.get("status") != record.get("status")
+                    or current.get("progress_fn") is not progress_fn
+                ):
+                    record = dict(current)
+                    progress = current.get("final_progress") or {}
+        else:
+            progress = record.get("final_progress") or {}
+
+        status = _normalize_progress_status(record.get("status"))
+        raw_children = progress.get("children") if isinstance(progress, dict) else []
+        all_children = [
+            raw for raw in (raw_children if isinstance(raw_children, list) else []) if isinstance(raw, dict)
+        ]
+        all_statuses = [_normalize_progress_status(raw.get("status")) for raw in all_children]
+        all_heartbeats = [
+            heartbeat
+            for raw in all_children
+            if (heartbeat := _progress_number(raw.get("heartbeat_at"))) is not None
+        ]
+        visible_children = sorted(
+            all_children,
+            key=lambda raw: (
+                _normalize_progress_status(raw.get("status")) in _PROGRESS_TERMINAL_STATUSES,
+                _progress_index(raw.get("task_index"), 0),
+            ),
+        )
+        children: List[Dict[str, Any]] = []
+        for raw in visible_children[:_MAX_PROGRESS_CHILDREN]:
+            child = {key: raw[key] for key in _PROGRESS_CHILD_KEYS if key in raw}
+            child["task_index"] = _progress_index(child.get("task_index"), 0)
+            child["status"] = _normalize_progress_status(child.get("status"))
+            child["phase"] = _progress_text(child.get("phase") or child["status"], 32)
+            if "current_tool" in child:
+                child["current_tool"] = _progress_text(child.get("current_tool"), 80)
+            for numeric_key in ("heartbeat_at", "api_calls", "budget_used", "budget_max"):
+                numeric_value = _progress_number(child.get(numeric_key))
+                if numeric_value is None:
+                    child.pop(numeric_key, None)
+                else:
+                    child[numeric_key] = numeric_value
+            heartbeat = child.get("heartbeat_at")
+            if isinstance(heartbeat, (int, float)):
+                child["heartbeat_age_seconds"] = round(
+                    max(0.0, observed_at - float(heartbeat)), 1
+                )
+            children.append(child)
+
+        goals = list(record.get("goals") or [])
+        total_count = len(goals) or (1 if record.get("goal") else len(all_children))
+        finished_statuses = {"completed", "failed", "interrupted"}
+        if status in _PROGRESS_TERMINAL_STATUSES:
+            finished_statuses.add("unknown")
+        finished_count = min(
+            total_count,
+            sum(1 for status_value in all_statuses if status_value in finished_statuses),
+        )
+        completed_count = min(
+            finished_count,
+            sum(1 for status_value in all_statuses if status_value == "completed"),
+        )
+        failed_count = min(
+            max(0, finished_count - completed_count),
+            sum(
+                1
+                for status_value in all_statuses
+                if status_value in {"failed", "interrupted", "unknown"}
+            ),
+        )
+
+        heartbeat_at = max(
+            all_heartbeats
+            or [float(record.get("completed_at") or record.get("dispatched_at") or observed_at)]
+        )
+        heartbeat_age = round(max(0.0, observed_at - heartbeat_at), 1)
+        phase = (
+            status
+            if status in _PROGRESS_TERMINAL_STATUSES
+            else "waiting_peer"
+            if 0 < finished_count < total_count
+            else "running"
+        )
+        snapshots.append(
+            {
+                "delegation_id": _progress_text(record.get("delegation_id"), 64),
+                "status": status,
+                "phase": phase,
+                "total_count": total_count,
+                "finished_count": finished_count,
+                "completed_count": completed_count,
+                "failed_count": failed_count,
+                "running_count": max(0, total_count - finished_count),
+                "progress_percent": round((finished_count / total_count) * 100)
+                if total_count
+                else 0,
+                "heartbeat_at": heartbeat_at,
+                "heartbeat_age_seconds": heartbeat_age,
+                "stale": status == "running"
+                and heartbeat_age > _PROGRESS_HEARTBEAT_STALE_SECONDS,
+                "children": children,
+            }
+        )
+    bounded: List[Dict[str, Any]] = []
+    for snapshot in snapshots:
+        candidate = [*bounded, snapshot]
+        encoded = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > _MAX_PROGRESS_DELEGATIONS_BYTES:
+            continue
+        bounded.append(snapshot)
+    return bounded
 
 
 def interrupt_all(reason: str = "shutdown") -> int:

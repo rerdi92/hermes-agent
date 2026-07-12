@@ -135,6 +135,8 @@ _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_notification_pollers_lock = threading.Lock()
+_notification_pollers: dict[str, tuple[threading.Event, threading.Thread]] = {}
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -558,6 +560,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
+    notification_thread = session.get("_notif_thread")
+    if (
+        notification_thread is not None
+        and notification_thread is not threading.current_thread()
+        and notification_thread.is_alive()
+    ):
+        notification_thread.join(timeout=1.0)
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -829,11 +838,25 @@ def _close_sessions_for_transport(
     return reaped, detached
 
 
+def _stop_all_notification_pollers(timeout: float = 1.0) -> None:
+    """Stop and bounded-join every poller, including orphaned session pollers."""
+    with _notification_pollers_lock:
+        pollers = list(_notification_pollers.values())
+    for stop_event, _thread in pollers:
+        stop_event.set()
+    deadline = time.monotonic() + max(0.0, timeout)
+    for _stop_event, thread in pollers:
+        if thread is threading.current_thread() or not thread.is_alive():
+            continue
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
 def _shutdown_sessions() -> None:
     with _sessions_lock:
         sids = list(_sessions)
     for sid in sids:
         _close_session_by_id(sid, end_reason="tui_shutdown")
+    _stop_all_notification_pollers()
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -3345,6 +3368,7 @@ def _current_profile_name() -> str:
 # cryptically downstream. Bump whenever the desktop's backend contract changes.
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
 DESKTOP_BACKEND_CONTRACT = 2
+_GATEWAY_PROCESS_INSTANCE_ID = uuid.uuid4().hex
 
 
 def _session_info(agent, session: dict | None = None) -> dict:
@@ -8221,6 +8245,42 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("delegation.progress")
+def _(rid, params: dict) -> dict:
+    """Return progress for one live, process-local Gateway session.
+
+    The client selects only the live session handle. Routing selectors used for
+    the registry match are derived from the server-owned session record, never
+    accepted directly from request parameters.
+    """
+    from tools.async_delegation import list_async_delegation_progress
+
+    requested_session_id = str(params.get("session_id") or "").strip()
+    if not requested_session_id:
+        return _err(rid, 4000, "session_id required")
+    session, err = _sess_nowait({"session_id": requested_session_id}, rid)
+    if err:
+        return err
+    assert session is not None
+    agent = session.get("agent")
+    owner_session_ids = [
+        requested_session_id,
+        str(session.get("session_key") or ""),
+        str(getattr(agent, "session_id", "") or ""),
+    ]
+
+    return _ok(
+        rid,
+        {
+            "delegations": list_async_delegation_progress(owner_session_ids=owner_session_ids),
+            "process_instance_id": _GATEWAY_PROCESS_INSTANCE_ID,
+            "process_local": True,
+            "schema_version": 1,
+            "snapshot_at": time.time(),
+        },
+    )
+
+
 @method("delegation.pause")
 def _(rid, params: dict) -> dict:
     from tools.delegate_tool import set_spawn_paused
@@ -8866,6 +8926,10 @@ def _notification_poller_loop(
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+    with _notification_pollers_lock:
+        current = _notification_pollers.get(sid)
+        if current is not None and current[1] is threading.current_thread():
+            _notification_pollers.pop(sid, None)
 
 
 def _wire_agent_terminal_output() -> None:
@@ -8921,7 +8985,11 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         target=_notification_poller_loop,
         args=(stop, sid, session),
         daemon=True,
+        name=f"notification-poller-{sid}",
     )
+    session["_notif_thread"] = t
+    with _notification_pollers_lock:
+        _notification_pollers[sid] = (stop, t)
     t.start()
     return stop
 

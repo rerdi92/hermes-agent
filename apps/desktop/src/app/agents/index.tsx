@@ -6,11 +6,17 @@ import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { Codicon } from '@/components/ui/codicon'
 import { FadeText } from '@/components/ui/fade-text'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { type Translations, useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
 import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
+import type {
+  DelegationChildProgress,
+  DelegationProgress,
+  DelegationStatusSnapshot
+} from '@/store/delegation-progress'
 import {
   $subagentsBySession,
   allSubagents,
@@ -21,6 +27,8 @@ import {
 } from '@/store/subagents'
 
 import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
+
+import { type DelegationProgressError, useDelegationProgress } from './use-delegation-progress'
 
 // Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 // same visual vocabulary as the chat tool blocks.
@@ -80,6 +88,7 @@ interface AgentsViewProps {
 export function AgentsView({ onClose }: AgentsViewProps) {
   const { t } = useI18n()
   const subagentsBySession = useStore($subagentsBySession)
+  const { error, snapshot, unavailable } = useDelegationProgress()
 
   // Aggregate every session, matching the status-bar indicator — a subagent
   // running in a background session must still be visible here, or the two
@@ -88,15 +97,230 @@ export function AgentsView({ onClose }: AgentsViewProps) {
 
   return (
     <Panel closeLabel={t.agents.close} onClose={onClose}>
-      {tree.length === 0 ? (
-        <PanelEmpty description={t.agents.emptyDesc} icon="hubot" title={t.agents.emptyTitle} />
-      ) : (
-        <>
-          <PanelHeader subtitle={t.agents.subtitle} title={t.agents.title} />
-          <SubagentTree tree={tree} />
-        </>
-      )}
+      <PanelHeader subtitle={t.agents.subtitle} title={t.agents.title} />
+      <DelegationWorkspace error={error} snapshot={snapshot} tree={tree} unavailable={unavailable} />
     </Panel>
+  )
+}
+
+interface DelegationWorkspaceProps {
+  error: DelegationProgressError
+  snapshot: DelegationStatusSnapshot | null
+  tree: SubagentNode[]
+  unavailable: boolean
+}
+
+const heartbeatAge = (seconds: number | null, a: Translations['agents']) => {
+  if (seconds === null || seconds < 2) {
+    return a.ageNow
+  }
+
+  if (seconds < 60) {
+    return a.ageSeconds(Math.round(seconds))
+  }
+
+  const minutes = Math.floor(seconds / 60)
+
+  return minutes < 60 ? a.ageMinutes(minutes) : a.ageHours(Math.floor(minutes / 60))
+}
+
+const phaseLabel = (phase: string, a: Translations['agents']) => {
+  const labels: Record<string, string> = {
+    completed: a.done,
+    error: a.failed,
+    failed: a.failed,
+    interrupted: a.interrupted,
+    unknown: a.unknown,
+    model: a.phaseModel,
+    queued: a.phaseQueued,
+    running: a.running,
+    starting: a.phaseStarting,
+    tool: a.phaseTool,
+    waiting_model: a.phaseWaitingModel,
+    waiting_peer: a.phaseWaitingPeer
+  }
+
+  return labels[phase] ?? phase
+}
+
+function DelegationCard({
+  active,
+  delegation,
+  onSelect
+}: {
+  active: boolean
+  delegation: DelegationProgress
+  onSelect: () => void
+}) {
+  const { t } = useI18n()
+  const label = delegation.id
+  const running = delegation.status === 'running'
+  const failed = !running && delegation.status !== 'completed'
+
+  const stateLabel = running
+    ? delegation.stale
+      ? t.agents.stale
+      : t.agents.live
+    : phaseLabel(delegation.status, t.agents)
+
+  return (
+    <button
+      aria-pressed={active}
+      className={cn(
+        'row-hover flex min-w-56 flex-1 flex-col gap-2 rounded-lg px-3 py-2.5 text-left transition-colors',
+        active ? 'bg-(--ui-row-active-background)' : 'bg-(--ui-control-background)'
+      )}
+      onClick={onSelect}
+      type="button"
+    >
+      <span className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-medium text-foreground/90">{label}</span>
+        <span className={cn('text-[0.62rem] font-medium', delegation.stale || failed ? 'text-destructive' : 'text-primary/80')}>
+          {stateLabel}
+        </span>
+      </span>
+      <span className="flex items-center justify-between gap-2 text-[0.66rem] text-muted-foreground/70">
+        <span>{t.agents.tasksFinished(delegation.finishedCount, delegation.totalCount)}</span>
+        <span>{delegation.progressPercent}%</span>
+      </span>
+      <span
+        aria-label={label}
+        aria-valuemax={100}
+        aria-valuemin={0}
+        aria-valuenow={delegation.progressPercent}
+        className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+      >
+        <span
+          className={cn('block h-full rounded-full transition-[width]', delegation.stale || failed ? 'bg-destructive' : 'bg-primary')}
+          style={{ width: `${delegation.progressPercent}%` }}
+        />
+      </span>
+      <span className="text-[0.62rem] text-muted-foreground/60">
+        {t.agents.heartbeat}: {heartbeatAge(delegation.heartbeatAgeSeconds, t.agents)} ·{' '}
+        {phaseLabel(delegation.phase, t.agents)}
+      </span>
+    </button>
+  )
+}
+
+function ChildProgressRow({ child }: { child: DelegationChildProgress }) {
+  const { t } = useI18n()
+
+  const telemetry = [
+    child.currentTool ? `${t.agents.phaseTool}: ${child.currentTool}` : '',
+    child.apiCalls !== null ? t.agents.apiCalls(child.apiCalls) : '',
+    child.budgetUsed !== null && child.budgetMax !== null ? t.agents.budget(child.budgetUsed, child.budgetMax) : '',
+    `${t.agents.heartbeat}: ${heartbeatAge(child.heartbeatAgeSeconds, t.agents)}`
+  ].filter(Boolean)
+
+  return (
+    <div className="grid min-w-0 gap-1 rounded-md bg-(--ui-control-background) px-3 py-2">
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <span className="truncate text-xs font-medium text-foreground/85">{`#${child.taskIndex + 1}`}</span>
+        <span className="shrink-0 text-[0.64rem] text-muted-foreground/70">
+          {phaseLabel(child.phase, t.agents)}
+        </span>
+      </div>
+      <p className="truncate text-[0.64rem] text-muted-foreground/60">{telemetry.join(' · ')}</p>
+    </div>
+  )
+}
+
+function DelegationDetail({ delegation }: { delegation: DelegationProgress | null }) {
+  const { t } = useI18n()
+
+  if (!delegation) {
+    return <PanelEmpty description={t.agents.emptyDesc} icon="pulse" title={t.agents.emptyTitle} />
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overscroll-contain pr-1">
+      <div className="mb-1 flex items-center justify-between gap-3 text-[0.68rem] text-muted-foreground/70">
+        <span>{t.agents.tasksFinished(delegation.finishedCount, delegation.totalCount)}</span>
+        <span>
+          {t.agents.heartbeat}: {heartbeatAge(delegation.heartbeatAgeSeconds, t.agents)}
+        </span>
+      </div>
+      {delegation.children.map(child => (
+        <ChildProgressRow child={child} key={`${delegation.id}:${child.taskIndex}`} />
+      ))}
+    </div>
+  )
+}
+
+export function DelegationWorkspace({ error, snapshot, tree, unavailable }: DelegationWorkspaceProps) {
+  const { t } = useI18n()
+  const delegations = snapshot?.delegations ?? []
+  const [selectedId, setSelectedId] = useState('')
+  const [tab, setTab] = useState<'progress' | 'tree'>('progress')
+  const selected = delegations.find(item => item.id === selectedId) ?? delegations[0] ?? null
+
+  useEffect(() => {
+    if (selected && selected.id !== selectedId) {
+      setSelectedId(selected.id)
+    }
+  }, [selected, selectedId])
+
+  return (
+    <div className="grid min-h-0 min-w-0 flex-1 grid-rows-[minmax(8.5rem,0.8fr)_minmax(12rem,1.2fr)] gap-3 overflow-hidden">
+      <section
+        className="flex min-h-0 flex-col gap-2 overflow-hidden rounded-xl bg-muted/25 p-2.5"
+        data-testid="delegation-progress-upper"
+      >
+        <div className="flex items-center justify-between gap-2 px-0.5">
+          <p className="text-[0.68rem] font-medium tracking-wide text-muted-foreground/75 uppercase">
+            {t.agents.progress}
+          </p>
+          {snapshot?.snapshotAt && snapshot.delegations.some(item => item.status === 'running') ? (
+            <p className="text-[0.62rem] text-muted-foreground/55">{t.agents.live}</p>
+          ) : null}
+        </div>
+        {unavailable ? (
+          <p className="text-xs leading-relaxed text-muted-foreground/75">{t.agents.noProgressApi}</p>
+        ) : error ? (
+          <p className="text-xs leading-relaxed text-muted-foreground/75">{t.agents.progressDisconnected}</p>
+        ) : delegations.length > 0 ? (
+          <div className="flex min-h-0 flex-1 gap-2 overflow-x-auto overscroll-contain pb-1">
+            {delegations.map(delegation => (
+              <DelegationCard
+                active={delegation.id === selected?.id}
+                delegation={delegation}
+                key={delegation.id}
+                onSelect={() => setSelectedId(delegation.id)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 place-items-center text-xs text-muted-foreground/65">
+            {t.agents.emptyTitle}
+          </div>
+        )}
+      </section>
+
+      <Tabs
+        className="min-h-0 gap-2 overflow-hidden"
+        onValueChange={value => setTab(value as 'progress' | 'tree')}
+        value={tab}
+      >
+        <TabsList className="h-8 w-fit shrink-0 bg-muted/60 p-0.5">
+          <TabsTrigger className="h-7 px-3 text-xs" value="progress">
+            {t.agents.progress}
+          </TabsTrigger>
+          <TabsTrigger className="h-7 px-3 text-xs" value="tree">
+            {t.agents.agentTree}
+          </TabsTrigger>
+        </TabsList>
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden" data-testid="delegation-progress-lower">
+          <TabsContent className="flex min-h-0 min-w-0 flex-1 overflow-hidden" value="progress">
+            <DelegationDetail delegation={selected} />
+          </TabsContent>
+          <TabsContent className="flex min-h-0 min-w-0 flex-1 overflow-hidden" value="tree">
+            <SubagentTree tree={tree} />
+          </TabsContent>
+        </div>
+      </Tabs>
+    </div>
   )
 }
 

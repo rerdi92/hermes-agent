@@ -955,7 +955,25 @@ export const ja = defineLocale({
     ageHours: hours => `${hours}時間前`,
     durationSeconds: seconds => `${seconds}秒`,
     durationMinutes: (minutes, seconds) => `${minutes}分 ${seconds}秒`,
-    tokens: value => `${value} トーク`
+    tokens: value => `${value} トーク`,
+    progress: '進捗',
+    agentTree: 'エージェントツリー',
+    heartbeat: 'ハートビート',
+    stale: '停止の可能性',
+    live: 'ライブ',
+    interrupted: '中断',
+    unknown: '不明',
+    tasksFinished: (finished, total) => `${finished}/${total} タスク完了`,
+    noProgressApi: 'ライブ進捗 API は利用できません。イベントストリームはエージェントツリーに表示されます。',
+    progressDisconnected: 'Gateway の切断またはリクエスト失敗により、ライブ進捗を一時的に取得できません。',
+    phaseStarting: '開始中',
+    phaseModel: 'モデル',
+    phaseTool: 'ツール',
+    phaseWaitingModel: 'モデル待機中',
+    phaseWaitingPeer: '他のエージェント待機中',
+    phaseQueued: 'キュー済み',
+    apiCalls: count => `${count} API コール`,
+    budget: (used, max) => `予算 ${used}/${max}`
   },
 
   commandCenter: {

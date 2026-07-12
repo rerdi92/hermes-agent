@@ -855,6 +855,24 @@ export interface Translations {
     durationSeconds: (seconds: string) => string
     durationMinutes: (minutes: number, seconds: number) => string
     tokens: (value: number | string) => string
+    progress: string
+    agentTree: string
+    heartbeat: string
+    stale: string
+    live: string
+    interrupted: string
+    unknown: string
+    tasksFinished: (finished: number, total: number) => string
+    noProgressApi: string
+    progressDisconnected: string
+    phaseStarting: string
+    phaseModel: string
+    phaseTool: string
+    phaseWaitingModel: string
+    phaseWaitingPeer: string
+    phaseQueued: string
+    apiCalls: (count: number) => string
+    budget: (used: number, max: number) => string
   }
 
   commandCenter: {

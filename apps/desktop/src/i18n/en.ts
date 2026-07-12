@@ -974,7 +974,25 @@ export const en: Translations = {
     ageHours: hours => `${hours}h ago`,
     durationSeconds: seconds => `${seconds}s`,
     durationMinutes: (minutes, seconds) => `${minutes}m ${seconds}s`,
-    tokens: value => `${value} tok`
+    tokens: value => `${value} tok`,
+    progress: 'Progress',
+    agentTree: 'Agent tree',
+    heartbeat: 'Heartbeat',
+    stale: 'Stale',
+    live: 'Live',
+    interrupted: 'Interrupted',
+    unknown: 'Unknown',
+    tasksFinished: (finished, total) => `${finished}/${total} tasks finished`,
+    noProgressApi: 'Live progress API is unavailable. Event-stream activity is still shown in Agent tree.',
+    progressDisconnected: 'Live progress is temporarily unavailable because the Gateway disconnected or the request failed.',
+    phaseStarting: 'Starting',
+    phaseModel: 'Model',
+    phaseTool: 'Tool',
+    phaseWaitingModel: 'Waiting for model',
+    phaseWaitingPeer: 'Waiting for peers',
+    phaseQueued: 'Queued',
+    apiCalls: count => `${count} API calls`,
+    budget: (used, max) => `budget ${used}/${max}`
   },
 
   commandCenter: {
