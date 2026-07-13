@@ -514,6 +514,61 @@ def test_delegation_progress_combines_live_children_and_async_batches(monkeypatc
     assert observed == [["owner-ui", "durable-owner", "stored-parent"]]
 
 
+def test_delegation_progress_rejects_oversized_request_id(monkeypatch):
+    monkeypatch.setitem(
+        server._sessions,
+        "owner-ui",
+        {"agent": None, "session_key": "durable-owner"},
+    )
+
+    resp = server.dispatch(
+        {
+            "id": "x" * 60_000,
+            "method": "delegation.progress",
+            "params": {"session_id": "owner-ui"},
+        }
+    )
+
+    assert resp["id"] is None
+    assert resp["error"]["code"] == -32600
+    assert len(json.dumps(resp, separators=(",", ":")).encode("utf-8")) <= 60_000
+
+
+def test_delegation_progress_enforces_serialized_envelope_cap(monkeypatch):
+    import tools.async_delegation as async_mod
+
+    monkeypatch.setitem(
+        server._sessions,
+        "owner-ui",
+        {"agent": None, "session_key": "durable-owner"},
+    )
+    monkeypatch.setattr(
+        async_mod,
+        "list_async_delegation_progress",
+        lambda *, owner_session_ids: [
+            {"delegation_id": f"deleg-{index}", "padding": "x" * 10_000}
+            for index in range(10)
+        ],
+    )
+
+    resp = server.dispatch(
+        {
+            "id": "delegation-progress",
+            "method": "delegation.progress",
+            "params": {"session_id": "owner-ui"},
+        }
+    )
+
+    encoded = json.dumps(
+        resp,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assert len(encoded) <= 60_000
+    assert 0 < len(resp["result"]["delegations"]) < 10
+
+
 def test_delegation_progress_rejects_non_live_session_id():
     resp = server.dispatch(
         {"id": "delegation-progress", "method": "delegation.progress", "params": {"session_id": "not-live"}}

@@ -1232,6 +1232,26 @@ def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
 
 
+_MAX_JSONRPC_REQUEST_ID_BYTES = 512
+
+
+def _valid_jsonrpc_request_id(rid: Any) -> bool:
+    if rid is not None and (
+        isinstance(rid, bool) or not isinstance(rid, (str, int, float))
+    ):
+        return False
+    try:
+        encoded = json.dumps(
+            rid,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(encoded) <= _MAX_JSONRPC_REQUEST_ID_BYTES
+
+
 def method(name: str):
     def dec(fn):
         _methods[name] = fn
@@ -1246,6 +1266,8 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
         return _err(None, -32600, "invalid request: expected an object")
 
     rid = req.get("id")
+    if not _valid_jsonrpc_request_id(rid):
+        return _err(None, -32600, "invalid request: id must be a bounded scalar")
     method = req.get("method")
     if not isinstance(method, str) or not method:
         return _err(rid, -32600, "invalid request: method must be a non-empty string")
@@ -8225,6 +8247,28 @@ def _(rid, params: dict) -> dict:
 # translators between JSON-RPC and the Python API.
 
 
+def _bounded_delegation_progress_response(rid: Any, result: dict) -> dict:
+    """Build a progress response whose serialized JSON-RPC envelope is bounded."""
+    from tools.async_delegation import _MAX_PROGRESS_RESPONSE_BYTES
+
+    bounded_result = dict(result)
+    delegations = list(bounded_result.get("delegations") or [])
+    bounded_result["delegations"] = delegations
+    while True:
+        response = _ok(rid, bounded_result)
+        encoded = json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_PROGRESS_RESPONSE_BYTES:
+            return response
+        if not delegations:
+            return _err(None, -32603, "delegation progress response exceeds size limit")
+        delegations.pop()
+
+
 @method("delegation.status")
 def _(rid, params: dict) -> dict:
     from tools.delegate_tool import (
@@ -8269,7 +8313,7 @@ def _(rid, params: dict) -> dict:
         str(getattr(agent, "session_id", "") or ""),
     ]
 
-    return _ok(
+    return _bounded_delegation_progress_response(
         rid,
         {
             "delegations": list_async_delegation_progress(owner_session_ids=owner_session_ids),
