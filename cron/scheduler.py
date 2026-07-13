@@ -297,7 +297,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
-_broker_running_job_ids: set = set()
+_broker_running_job_tokens: dict[str, set[object]] = {}
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -308,6 +308,7 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+_interrupted_job_remaining: dict[str, int] = {}
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -326,7 +327,26 @@ def get_running_job_ids() -> "frozenset[str]":
     blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(_running_job_ids | _broker_running_job_ids)
+        return frozenset(_running_job_ids | _broker_running_job_tokens.keys())
+
+
+def _register_broker_running_job(job_id: str) -> object:
+    """Register one exact broker worker owner for ``job_id``."""
+    token = object()
+    with _running_lock:
+        _broker_running_job_tokens.setdefault(job_id, set()).add(token)
+    return token
+
+
+def _release_broker_running_job(job_id: str, token: object) -> None:
+    """Release only the exact broker worker owner represented by ``token``."""
+    with _running_lock:
+        owners = _broker_running_job_tokens.get(job_id)
+        if not owners or token not in owners:
+            return
+        owners.remove(token)
+        if not owners:
+            _broker_running_job_tokens.pop(job_id, None)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -354,9 +374,17 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     Returns the list of job IDs marked, for the caller to log.
     """
     with _running_lock:
-        broker_job_ids = set(_broker_running_job_ids)
+        broker_job_ids = set(_broker_running_job_tokens)
         job_ids = list(_running_job_ids | broker_job_ids)
         _interrupted_job_ids.update(job_ids)
+        for job_id in job_ids:
+            owner_count = len(_broker_running_job_tokens.get(job_id, ()))
+            if job_id in _running_job_ids:
+                owner_count += 1
+            _interrupted_job_remaining[job_id] = max(
+                owner_count,
+                _interrupted_job_remaining.get(job_id, 0),
+            )
     marked = []
     for job_id in job_ids:
         if job_id in broker_job_ids:
@@ -397,6 +425,15 @@ def _consume_interrupted_flag(job_id: str) -> bool:
     the flag from leaking across a later, unrelated run of the same job ID
     (recurring jobs reuse their ID every fire)."""
     with _running_lock:
+        remaining = _interrupted_job_remaining.get(job_id, 0)
+        if remaining > 0:
+            remaining -= 1
+            if remaining:
+                _interrupted_job_remaining[job_id] = remaining
+            else:
+                _interrupted_job_remaining.pop(job_id, None)
+                _interrupted_job_ids.discard(job_id)
+            return True
         if job_id in _interrupted_job_ids:
             _interrupted_job_ids.discard(job_id)
             return True
@@ -3585,8 +3622,7 @@ def _run_reserved_job_effects(
 ):
     """Run effects for a broker-reserved snapshot without jobs-store mutation."""
     job_id = str(job.get("id") or "")
-    with _running_lock:
-        _broker_running_job_ids.add(job_id)
+    owner_token = _register_broker_running_job(job_id)
     try:
         return _run_one_job_effects(
             job,
@@ -3596,8 +3632,7 @@ def _run_reserved_job_effects(
             _reserved_attempt=True,
         )
     finally:
-        with _running_lock:
-            _broker_running_job_ids.discard(job_id)
+        _release_broker_running_job(job_id, owner_token)
 
 
 def _notify_provider_jobs_changed() -> None:

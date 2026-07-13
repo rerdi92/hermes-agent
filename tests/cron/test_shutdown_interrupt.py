@@ -23,12 +23,14 @@ def _reset_scheduler_state():
     import cron.scheduler as sched
 
     sched._running_job_ids.clear()
-    sched._broker_running_job_ids.clear()
+    sched._broker_running_job_tokens.clear()
     sched._interrupted_job_ids.clear()
+    sched._interrupted_job_remaining.clear()
     yield
     sched._running_job_ids.clear()
-    sched._broker_running_job_ids.clear()
+    sched._broker_running_job_tokens.clear()
     sched._interrupted_job_ids.clear()
+    sched._interrupted_job_remaining.clear()
 
 
 class TestGetRunningJobIds:

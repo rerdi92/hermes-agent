@@ -798,3 +798,38 @@ def test_gateway_reserved_interrupt_commits_through_attempt_cas(store):
     assert "gateway shutdown" in persisted["last_error"]
     assert persisted["run_claim"] is None
     assert persisted["fire_claim"] is None
+
+
+def test_broker_running_registry_requires_all_exact_owners_to_release():
+    import cron.scheduler as scheduler
+
+    first = scheduler._register_broker_running_job("shared-id")
+    second = scheduler._register_broker_running_job("shared-id")
+    try:
+        assert first is not second
+        assert scheduler.get_running_job_ids() == frozenset({"shared-id"})
+
+        scheduler._release_broker_running_job("shared-id", first)
+        assert scheduler.get_running_job_ids() == frozenset({"shared-id"})
+
+        scheduler._release_broker_running_job("shared-id", second)
+        assert scheduler.get_running_job_ids() == frozenset()
+    finally:
+        scheduler._broker_running_job_tokens.clear()
+
+
+def test_broker_interrupt_flag_is_consumable_once_per_active_owner():
+    import cron.scheduler as scheduler
+
+    first = scheduler._register_broker_running_job("shared-id")
+    second = scheduler._register_broker_running_job("shared-id")
+    try:
+        assert scheduler.mark_running_jobs_interrupted("shutdown") == ["shared-id"]
+        assert scheduler._consume_interrupted_flag("shared-id") is True
+        assert scheduler._consume_interrupted_flag("shared-id") is True
+        assert scheduler._consume_interrupted_flag("shared-id") is False
+    finally:
+        scheduler._release_broker_running_job("shared-id", first)
+        scheduler._release_broker_running_job("shared-id", second)
+        scheduler._interrupted_job_ids.clear()
+        scheduler._interrupted_job_remaining.clear()
