@@ -5,7 +5,7 @@ import { parseDelegationStatus } from './delegation-progress'
 describe('delegation progress payload', () => {
   it('recomputes completion percent from finished and total counts', () => {
     const parsed = parseDelegationStatus({
-      schema_version: 2,
+      schema_version: 1,
       process_instance_id: 'proc-1',
       process_local: true,
       snapshot_at: 123,
@@ -46,7 +46,9 @@ describe('delegation progress payload', () => {
 
   it('drops malformed rows and clamps impossible counts', () => {
     const parsed = parseDelegationStatus({
-      schema_version: 2,
+      schema_version: 1,
+      process_instance_id: 'proc-1',
+      process_local: true,
       delegations: [
         null,
         {},
@@ -82,5 +84,16 @@ describe('delegation progress payload', () => {
         { taskIndex: 2, status: 'interrupted', phase: 'interrupted' }
       ]
     })
+  })
+
+  it.each([
+    null,
+    {},
+    { schema_version: 2, process_instance_id: 'proc-1', process_local: true, delegations: [] },
+    { schema_version: 1, process_instance_id: '', process_local: true, delegations: [] },
+    { schema_version: 1, process_instance_id: 'proc-1', process_local: false, delegations: [] },
+    { schema_version: 1, process_instance_id: 'proc-1', process_local: true, delegations: {} }
+  ])('rejects a malformed or non-authoritative root payload', payload => {
+    expect(() => parseDelegationStatus(payload)).toThrow('Invalid delegation progress payload')
   })
 })

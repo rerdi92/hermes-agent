@@ -10,7 +10,9 @@ afterEach(cleanup)
 describe('DelegationWorkspace', () => {
   it('renders split panes, truthful progress, heartbeat, and detail tabs', () => {
     const snapshot = parseDelegationStatus({
-      schema_version: 2,
+      schema_version: 1,
+      process_instance_id: 'proc-test',
+      process_local: true,
       snapshot_at: 110,
       delegations: [
         {
@@ -63,6 +65,8 @@ describe('DelegationWorkspace', () => {
   it('does not label a terminal delegation as live', () => {
     const snapshot = parseDelegationStatus({
       schema_version: 1,
+      process_instance_id: 'proc-test',
+      process_local: true,
       snapshot_at: 110,
       delegations: [
         {
@@ -87,6 +91,8 @@ describe('DelegationWorkspace', () => {
   it('labels interrupted and unknown states distinctly from failed', () => {
     const snapshot = parseDelegationStatus({
       schema_version: 1,
+      process_instance_id: 'proc-test',
+      process_local: true,
       delegations: [
         {
           delegation_id: 'deleg-interrupted',

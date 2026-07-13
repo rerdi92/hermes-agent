@@ -11615,8 +11615,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # the key bindings.
         _last_countdown_refresh = _time.monotonic()
         while True:
+            remaining = self._clarify_deadline - _time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                result = response_queue.get(timeout=1)
+                result = response_queue.get(timeout=min(1.0, remaining))
                 self._clarify_deadline = 0
                 self._persist_prompt_summary("?", "Clarify", question, str(result))
                 return result

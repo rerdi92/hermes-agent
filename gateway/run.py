@@ -18529,6 +18529,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not _status_adapter:
                     return ""
 
+                timeout = _clarify_mod.get_clarify_timeout(choices)
+                if timeout <= 0:
+                    return _clarify_mod.format_wait_result(None, timeout)
+
                 clarify_id = _uuid.uuid4().hex[:10]
                 _clarify_mod.register(
                     clarify_id=clarify_id,
@@ -18564,7 +18568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     send_ok = False
                 else:
                     try:
-                        result = fut.result(timeout=15)
+                        result = fut.result(timeout=min(15.0, float(timeout)))
                         send_ok = bool(getattr(result, "success", False))
                     except Exception as exc:
                         logger.warning("Clarify send failed: %s", exc)

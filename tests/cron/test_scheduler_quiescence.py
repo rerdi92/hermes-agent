@@ -712,6 +712,12 @@ def test_gateway_reserved_runner_does_not_repeat_claim_or_terminal_mutation(stor
     import cron.scheduler as scheduler
 
     submitter = CapturingSubmitter()
+    observed_running_counts = []
+
+    def run_job(*args, **kwargs):
+        observed_running_counts.append(len(scheduler.get_running_job_ids()))
+        return True, "output", "final response", None
+
     broker = _broker(
         store,
         submitter,
@@ -722,8 +728,7 @@ def test_gateway_reserved_runner_does_not_repeat_claim_or_terminal_mutation(stor
     with patch("cron.scheduler.claim_dispatch") as claim, patch(
         "cron.scheduler.mark_job_run"
     ) as mark, patch(
-        "cron.scheduler.run_job",
-        return_value=(True, "output", "final response", None),
+        "cron.scheduler.run_job", side_effect=run_job,
     ), patch(
         "cron.scheduler.save_job_output", return_value="/tmp/output"
     ), patch(
@@ -741,6 +746,8 @@ def test_gateway_reserved_runner_does_not_repeat_claim_or_terminal_mutation(stor
     assert accepted.status.value == "ACCEPTED"
     assert completed.status.value == "COMPLETED"
     assert completed.run_success is True
+    assert observed_running_counts == [1]
+    assert scheduler.get_running_job_ids() == frozenset()
     claim.assert_not_called()
     mark.assert_not_called()
     persisted = jobs.get_job("j1")
@@ -748,3 +755,46 @@ def test_gateway_reserved_runner_does_not_repeat_claim_or_terminal_mutation(stor
     assert persisted["run_claim"] is None
     assert persisted["fire_claim"] is None
     assert broker.ledger_snapshot()["active_by_job_id"] == {}
+
+
+def test_gateway_reserved_interrupt_commits_through_attempt_cas(store):
+    jobs, _home, now = store
+    import cron.scheduler as scheduler
+
+    submitter = CapturingSubmitter()
+
+    def interrupted_run(*args, **kwargs):
+        assert scheduler.mark_running_jobs_interrupted("gateway shutdown") == ["j1"]
+        return True, "truncated output", "plausible final response", None
+
+    broker = _broker(
+        store,
+        submitter,
+        lambda job: scheduler._run_reserved_job_effects(job),
+    )
+    due = jobs.scan_due_jobs_read_only(now).jobs[0]
+
+    with patch("cron.scheduler.mark_job_run") as legacy_mark, patch(
+        "cron.scheduler.run_job", side_effect=interrupted_run,
+    ), patch(
+        "cron.scheduler.save_job_output", return_value="/tmp/output"
+    ), patch(
+        "cron.scheduler._deliver_result", return_value=None
+    ), patch(
+        "agent.secret_scope.build_profile_secret_scope", return_value=None
+    ), patch(
+        "agent.secret_scope.set_secret_scope", return_value=object()
+    ), patch(
+        "agent.secret_scope.reset_secret_scope"
+    ):
+        broker.admit(due, mode="ticker")
+        completed = submitter.calls[0]()
+
+    assert completed.status.value == "COMPLETED"
+    assert completed.run_success is False
+    legacy_mark.assert_not_called()
+    persisted = jobs.get_job("j1")
+    assert persisted["last_status"] == "error"
+    assert "gateway shutdown" in persisted["last_error"]
+    assert persisted["run_claim"] is None
+    assert persisted["fire_claim"] is None

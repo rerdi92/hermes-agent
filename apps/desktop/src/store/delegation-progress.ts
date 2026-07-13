@@ -34,6 +34,8 @@ export interface DelegationStatusSnapshot {
   delegations: DelegationProgress[]
 }
 
+const DELEGATION_PROGRESS_SCHEMA_VERSION = 1
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -145,16 +147,27 @@ function parseDelegation(value: unknown): DelegationProgress | null {
 
 export function parseDelegationStatus(value: unknown): DelegationStatusSnapshot {
   const raw = record(value)
+  const processInstanceId = text(raw?.process_instance_id).trim()
 
-  const delegations = Array.isArray(raw?.delegations)
-    ? raw.delegations.map(parseDelegation).filter((item): item is DelegationProgress => item !== null)
-    : []
+  if (
+    !raw ||
+    raw.schema_version !== DELEGATION_PROGRESS_SCHEMA_VERSION ||
+    raw.process_local !== true ||
+    !processInstanceId ||
+    !Array.isArray(raw.delegations)
+  ) {
+    throw new Error('Invalid delegation progress payload')
+  }
+
+  const delegations = raw.delegations
+    .map(parseDelegation)
+    .filter((item): item is DelegationProgress => item !== null)
 
   return {
-    schemaVersion: count(raw?.schema_version),
-    processInstanceId: text(raw?.process_instance_id),
-    processLocal: raw?.process_local === true,
-    snapshotAt: numberOrNull(raw?.snapshot_at),
+    schemaVersion: DELEGATION_PROGRESS_SCHEMA_VERSION,
+    processInstanceId,
+    processLocal: true,
+    snapshotAt: numberOrNull(raw.snapshot_at),
     delegations
   }
 }

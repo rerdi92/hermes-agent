@@ -270,7 +270,7 @@ def format_wait_result(response: Optional[str], timeout: int) -> str:
 # Config
 # =========================================================================
 
-def get_clarify_timeout(choices: Optional[List[str]] = None) -> int:
+def get_clarify_timeout(choices: Optional[List[str]] = None) -> float:
     """Read the clarify wait from config and cap re-offered choice prompts.
 
     Historical single-shot/open-ended prompts keep the configured timeout.

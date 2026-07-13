@@ -13,6 +13,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 
 import json
 import time
+from contextvars import ContextVar
 from typing import List, Optional, Callable
 
 
@@ -29,6 +30,10 @@ _CLARIFY_TIMEOUT_SENTINELS = (
     "the user did not provide a response within the time limit",
 )
 _CLARIFY_CANCELLED_SENTINEL = "[clarify prompt cancelled]"
+_CLARIFY_REOFFER_DEADLINE: ContextVar[Optional[float]] = ContextVar(
+    "clarify_reoffer_deadline",
+    default=None,
+)
 
 
 def _coerce_reoffer_policy(agent_cfg: dict) -> tuple[int, int]:
@@ -63,17 +68,30 @@ def _load_reoffer_policy() -> tuple[int, int]:
     return _coerce_reoffer_policy(agent_cfg)
 
 
-def cap_clarify_attempt_timeout(timeout: int, agent_cfg: Optional[dict] = None) -> int:
-    """Cap one choice-UI wait at 400s only when bounded re-offer is enabled."""
+def cap_clarify_attempt_timeout(timeout: float, agent_cfg: Optional[dict] = None) -> float:
+    """Cap one choice-UI wait by both the attempt and overall deadlines."""
     try:
-        normalized_timeout = max(1, int(timeout))
+        normalized_timeout = max(1.0, float(timeout))
     except (TypeError, ValueError):
-        normalized_timeout = MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS
+        normalized_timeout = float(MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS)
 
     policy = _coerce_reoffer_policy(agent_cfg) if agent_cfg is not None else _load_reoffer_policy()
     if policy[0] > 1:
-        return min(normalized_timeout, MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS)
-    return normalized_timeout
+        normalized_timeout = min(
+            normalized_timeout,
+            float(MAX_REOFFER_ATTEMPT_TIMEOUT_SECONDS),
+        )
+    deadline = _CLARIFY_REOFFER_DEADLINE.get()
+    if deadline is None:
+        return (
+            int(normalized_timeout)
+            if normalized_timeout.is_integer()
+            else normalized_timeout
+        )
+    return min(
+        normalized_timeout,
+        max(0.0, deadline - time.monotonic()),
+    )
 
 
 def _is_retryable_no_selection(response: str) -> bool:
@@ -182,6 +200,7 @@ def clarify_tool(
     for attempt_index in range(max_attempts):
         if attempt_index > 0 and deadline is not None and time.monotonic() >= deadline:
             break
+        deadline_token = _CLARIFY_REOFFER_DEADLINE.set(deadline)
         try:
             user_response = callback(question, choices)
         except Exception as exc:
@@ -189,6 +208,8 @@ def clarify_tool(
                 {"error": f"Failed to get user input: {exc}"},
                 ensure_ascii=False,
             )
+        finally:
+            _CLARIFY_REOFFER_DEADLINE.reset(deadline_token)
         attempts_used += 1
         if not _is_retryable_no_selection(user_response):
             break

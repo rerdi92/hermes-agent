@@ -2055,7 +2055,7 @@ _CLARIFY_TIMEOUT_SENTINEL = "[clarify prompt timed out]"
 _CLARIFY_CANCELLED_SENTINEL = "[clarify prompt cancelled]"
 
 
-def _resolve_clarify_timeout(choices: list[str] | None = None) -> int:
+def _resolve_clarify_timeout(choices: list[str] | None = None) -> float:
     """Use profile timeout; hard-cap re-offered choice prompts at 400s."""
     try:
         cfg = _load_cfg() or {}

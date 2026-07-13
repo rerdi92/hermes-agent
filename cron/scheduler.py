@@ -297,6 +297,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+_broker_running_job_ids: set = set()
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -325,7 +326,7 @@ def get_running_job_ids() -> "frozenset[str]":
     blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(_running_job_ids)
+        return frozenset(_running_job_ids | _broker_running_job_ids)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -353,10 +354,17 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     Returns the list of job IDs marked, for the caller to log.
     """
     with _running_lock:
-        job_ids = list(_running_job_ids)
+        broker_job_ids = set(_broker_running_job_ids)
+        job_ids = list(_running_job_ids | broker_job_ids)
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
+        if job_id in broker_job_ids:
+            # The reserved worker consumes the interrupt flag and commits the
+            # failure through complete_reserved_attempt(). Calling the legacy
+            # writer here would clear the reservation outside its attempt CAS.
+            marked.append(job_id)
+            continue
         try:
             mark_job_run(job_id, False, reason)
             marked.append(job_id)
@@ -3576,13 +3584,20 @@ def _run_reserved_job_effects(
     job: dict, *, adapters=None, loop=None, verbose: bool = False
 ):
     """Run effects for a broker-reserved snapshot without jobs-store mutation."""
-    return _run_one_job_effects(
-        job,
-        adapters=adapters,
-        loop=loop,
-        verbose=verbose,
-        _reserved_attempt=True,
-    )
+    job_id = str(job.get("id") or "")
+    with _running_lock:
+        _broker_running_job_ids.add(job_id)
+    try:
+        return _run_one_job_effects(
+            job,
+            adapters=adapters,
+            loop=loop,
+            verbose=verbose,
+            _reserved_attempt=True,
+        )
+    finally:
+        with _running_lock:
+            _broker_running_job_ids.discard(job_id)
 
 
 def _notify_provider_jobs_changed() -> None:

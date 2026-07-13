@@ -40,6 +40,8 @@ describe('useDelegationProgress', () => {
   it('polls the dedicated progress RPC and parses the snapshot', async () => {
     requestGateway.mockResolvedValue({
       schema_version: 1,
+      process_instance_id: 'proc-test',
+      process_local: true,
       snapshot_at: 123,
       delegations: [{ delegation_id: 'deleg-1', total_count: 1, finished_count: 0 }]
     })
@@ -70,6 +72,8 @@ describe('useDelegationProgress', () => {
       .mockRejectedValueOnce(new Error('unknown method: delegation.progress'))
       .mockResolvedValue({
         schema_version: 1,
+        process_instance_id: 'proc-test',
+        process_local: true,
         delegations: [{ delegation_id: 'deleg-new', status: 'running', total_count: 1, finished_count: 0 }]
       })
 
@@ -93,6 +97,8 @@ describe('useDelegationProgress', () => {
       .mockRejectedValueOnce(new Error('unknown method: delegation.progress'))
       .mockResolvedValue({
         schema_version: 1,
+        process_instance_id: 'proc-test',
+        process_local: true,
         delegations: [{ delegation_id: 'deleg-replaced', status: 'running', total_count: 1, finished_count: 0 }]
       })
 
@@ -109,6 +115,8 @@ describe('useDelegationProgress', () => {
     requestGateway
       .mockResolvedValueOnce({
         schema_version: 1,
+        process_instance_id: 'proc-test',
+        process_local: true,
         snapshot_at: 123,
         delegations: [{ delegation_id: 'deleg-1', status: 'running', total_count: 1, finished_count: 0 }]
       })
@@ -123,7 +131,12 @@ describe('useDelegationProgress', () => {
 
   it('does not poll while the document is hidden and resumes when visible', async () => {
     Object.defineProperty(document, 'hidden', { configurable: true, value: true })
-    requestGateway.mockResolvedValue({ schema_version: 1, delegations: [] })
+    requestGateway.mockResolvedValue({
+      schema_version: 1,
+      process_instance_id: 'proc-test',
+      process_local: true,
+      delegations: []
+    })
 
     render(<Probe />)
     await new Promise(resolve => window.setTimeout(resolve, 25))
@@ -141,5 +154,15 @@ describe('useDelegationProgress', () => {
 
     await waitFor(() => expect(screen.getByTestId('error').textContent).toBe('disconnected'))
     expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('treats a malformed root payload as a transient contract failure', async () => {
+    requestGateway.mockResolvedValue({ schema_version: 1, delegations: [] })
+
+    render(<Probe />)
+
+    await waitFor(() => expect(screen.getByTestId('error').textContent).toBe('transient'))
+    expect(screen.getByTestId('delegation-id').textContent).toBe('')
+    expect(screen.getByTestId('unavailable').textContent).toBe('false')
   })
 })
