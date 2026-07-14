@@ -240,6 +240,16 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
 
   const sessionListHasResults = filteredSessions.length > 0
 
+  const restartDesktop = useCallback(async () => {
+    setSystemError('')
+
+    try {
+      await window.hermesDesktop.restartDesktop()
+    } catch (error) {
+      setSystemError(error instanceof Error ? error.message : String(error))
+    }
+  }, [])
+
   // Client-side substring filter over the fetched tail (matches `hermes logs --search`).
   const visibleLogs = useMemo(() => {
     const needle = logQuery.trim().toLowerCase()
@@ -426,6 +436,9 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
                         </div>
                       </div>
                       <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 whitespace-nowrap max-[47.5rem]:whitespace-normal">
+                        <Button onClick={() => void restartDesktop()} size="xs" variant="text">
+                          {cc.restartHermes}
+                        </Button>
                         <Button onClick={() => void runSystemAction('restart')} size="xs" variant="text">
                           {cc.restartGateway}
                         </Button>

@@ -17643,6 +17643,56 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
+def _desktop_shutdown_file_from_env() -> Optional[Path]:
+    """Return the private Desktop-owned graceful-shutdown marker path.
+
+    The marker seam exists only for a backend spawned by Hermes Desktop. It is
+    intentionally not an HTTP endpoint: Electron already owns the child and
+    passes a unique absolute path in that child's environment. Dashboard,
+    ``serve`` from a terminal, and remote backends remain unaffected.
+    """
+    if os.environ.get("HERMES_DESKTOP") != "1":
+        return None
+
+    raw = (os.environ.get("HERMES_DESKTOP_SHUTDOWN_FILE") or "").strip()
+    if not raw:
+        return None
+
+    marker = Path(raw).expanduser()
+    if not marker.is_absolute():
+        _log.warning("Ignoring relative HERMES_DESKTOP_SHUTDOWN_FILE: %r", raw)
+        return None
+    return marker
+
+
+async def _watch_desktop_shutdown(
+    server: Any,
+    marker: Path,
+    *,
+    poll_interval: float = 0.1,
+) -> bool:
+    """Ask uvicorn to exit when Electron creates its private marker.
+
+    Returning through uvicorn's own main loop preserves graceful connection
+    drain, lifespan cleanup, and Python atexit/session finalizers. This helper
+    never signals or terminates the process.
+    """
+    while not server.should_exit:
+        try:
+            requested = marker.is_file()
+        except OSError:
+            requested = False
+
+        if requested:
+            _log.info("Desktop requested graceful backend shutdown via %s", marker)
+            server.should_exit = True
+            return True
+
+        await asyncio.sleep(max(0.001, poll_interval))
+
+    return False
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -17872,7 +17922,23 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
+            desktop_shutdown_file = _desktop_shutdown_file_from_env()
+            desktop_shutdown_task = (
+                asyncio.create_task(
+                    _watch_desktop_shutdown(server, desktop_shutdown_file)
+                )
+                if desktop_shutdown_file is not None
+                else None
+            )
+            try:
+                await server.main_loop()
+            finally:
+                if desktop_shutdown_task is not None:
+                    desktop_shutdown_task.cancel()
+                    try:
+                        await desktop_shutdown_task
+                    except asyncio.CancelledError:
+                        pass
             if server.started:
                 await server.shutdown()
 

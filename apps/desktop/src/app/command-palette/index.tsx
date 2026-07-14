@@ -495,6 +495,13 @@ export function CommandPalette() {
             run: go(`${COMMAND_CENTER_ROUTE}?section=usage`)
           },
           {
+            icon: Monitor,
+            id: 'cc-restart-hermes',
+            keywords: ['desktop', 'app', 'restart', 'relaunch', 'hermes', 'system'],
+            label: cc.restartHermes,
+            run: () => void window.hermesDesktop.restartDesktop()
+          },
+          {
             icon: RefreshCw,
             id: 'cc-restart-gateway',
             keywords: ['gateway', 'restart', 'messaging', 'reconnect', 'system'],
