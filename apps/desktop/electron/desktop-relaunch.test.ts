@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import test from 'node:test'
+
+import { test } from 'vitest'
 
 import {
   type BackendShutdownTarget,
@@ -13,7 +14,9 @@ import {
   invalidateDesktopOwnedStartupEntry,
   isBackendChildRunning,
   requestBackendShutdown,
+  requestRelaunchWithRecovery,
   runOperationWithPostRelease,
+  runRelaunchQuitHandoff,
 } from './desktop-relaunch'
 
 class FakeChild extends EventEmitter {
@@ -463,6 +466,137 @@ test('coordinator deduplicates concurrent requests and relaunches only after eve
   assert.equal(shutdownCalls, 1)
   assert.equal(relaunchCalls, 1)
   assert.equal(quitCalls, 1)
+})
+
+test('quit failure recovers and retries without issuing a duplicate relaunch', async () => {
+  let failQuit = true
+  let handoffActive = false
+  let recoveries = 0
+  let relaunchCalls = 0
+  let lifecycle: ReturnType<typeof createDesktopRelaunchLifecycle>
+
+  const coordinate = createGracefulRelaunchCoordinator({
+    getTargets: () => [],
+    preflight: () => ({ ok: true as const }),
+    quit: () =>
+      runRelaunchQuitHandoff({
+        markRelaunching: () => lifecycle.markRelaunching(),
+        quit: () => {
+          if (failQuit) {
+            failQuit = false
+            throw new Error('synthetic quit failure')
+          }
+        },
+        setHandoffActive: active => {
+          handoffActive = active
+        }
+      }),
+    relaunch: () => {
+      relaunchCalls += 1
+    },
+    shutdownTargets: async () => ({ ok: true as const, results: [] })
+  })
+
+  lifecycle = createDesktopRelaunchLifecycle(coordinate, {
+    isHandoffActive: () => handoffActive,
+    isRelaunchPending: () => coordinate.relaunchIssued
+  })
+
+  const requestWithRecovery = () =>
+    requestRelaunchWithRecovery(lifecycle, async assertActive => {
+      assertActive()
+      recoveries += 1
+    })
+
+  assert.deepEqual(await requestWithRecovery(), { ok: false, reason: 'quit-failed-after-relaunch' })
+  assert.equal(handoffActive, false)
+  assert.equal(lifecycle.active, false)
+  assert.equal(coordinate.relaunchIssued, true)
+  assert.equal(recoveries, 1)
+  assert.throws(() => lifecycle.assertOperationAllowed('update'), /restart is already scheduled/)
+
+  assert.deepEqual(await requestWithRecovery(), { ok: true, reason: 'relaunching' })
+  assert.equal(handoffActive, true)
+  assert.equal(lifecycle.active, true)
+  assert.equal(recoveries, 1)
+  assert.equal(relaunchCalls, 1)
+})
+
+test('relaunch publication failure recovers without a pending latch or quit', async () => {
+  let quitCalls = 0
+  let recoveries = 0
+
+  const coordinate = createGracefulRelaunchCoordinator({
+    getTargets: () => [],
+    preflight: () => ({ ok: true as const }),
+    quit: () => {
+      quitCalls += 1
+    },
+    relaunch: () => {
+      throw new Error('synthetic relaunch failure')
+    },
+    shutdownTargets: async () => ({ ok: true as const, results: [] })
+  })
+
+  const lifecycle = createDesktopRelaunchLifecycle(coordinate, {
+    isRelaunchPending: () => coordinate.relaunchIssued
+  })
+
+  const result = await requestRelaunchWithRecovery(lifecycle, assertActive => {
+    assertActive()
+    recoveries += 1
+  })
+
+  assert.deepEqual(result, { ok: false, reason: 'relaunch-failed' })
+  assert.equal(coordinate.relaunchIssued, false)
+  assert.equal(quitCalls, 0)
+  assert.equal(recoveries, 1)
+  assert.equal(lifecycle.active, false)
+  assert.doesNotThrow(() => lifecycle.assertOperationAllowed('update'))
+})
+
+test('relaunch publication failure recovery holds a real lease against competing operations', async () => {
+  let releaseRecovery: (() => void) | undefined
+  let signalRecoveryStarted: (() => void) | undefined
+
+  const recoveryGate = new Promise<void>(resolve => {
+    releaseRecovery = resolve
+  })
+  const recoveryStarted = new Promise<void>(resolve => {
+    signalRecoveryStarted = resolve
+  })
+  const coordinate = createGracefulRelaunchCoordinator({
+    getTargets: () => [],
+    preflight: () => ({ ok: true as const }),
+    quit: () => undefined,
+    relaunch: () => {
+      throw new Error('synthetic relaunch failure')
+    },
+    shutdownTargets: async () => ({ ok: true as const, results: [] })
+  })
+  const lifecycle = createDesktopRelaunchLifecycle(coordinate, {
+    isRelaunchPending: () => coordinate.relaunchIssued
+  })
+
+  const request = requestRelaunchWithRecovery(lifecycle, async assertActive => {
+    signalRecoveryStarted?.()
+    await recoveryGate
+    assertActive()
+  })
+  await recoveryStarted
+
+  let competingError: unknown
+  try {
+    await lifecycle.runOperation('update', async () => undefined)
+  } catch (error) {
+    competingError = error
+  } finally {
+    releaseRecovery?.()
+  }
+
+  assert.match(String(competingError), /operation is active/)
+  assert.deepEqual(await request, { ok: false, reason: 'relaunch-failed' })
+  assert.doesNotThrow(() => lifecycle.assertOperationAllowed('update'))
 })
 
 test('coordinator keeps the app open when preflight or backend drain fails', async () => {

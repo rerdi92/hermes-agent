@@ -1202,6 +1202,96 @@ class TestWorktreeCleanupSafety:
         finally:
             _force_remove_worktree(info)
 
+    def test_archive_destination_race_is_not_reported_as_archived(
+        self,
+        git_repo,
+        monkeypatch,
+    ):
+        import cli as cli_mod
+
+        info = cli_mod._setup_worktree(str(git_repo), sync_base=False)
+        assert info is not None
+        archive_path = git_repo / ".worktrees" / ".archive" / Path(info["path"]).name
+        real_run = subprocess.run
+
+        def create_competing_destination(args, **kwargs):
+            if args[1:3] == ["worktree", "move"]:
+                archive_path.mkdir(parents=True, exist_ok=False)
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="injected destination race",
+                )
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", create_competing_destination)
+        try:
+            outcome = cli_mod._archive_worktree_if_unchanged(
+                str(git_repo),
+                info["path"],
+                expected_branch=info["branch"],
+            )
+
+            assert outcome["status"] != "archived_branch_preserved"
+            assert outcome["status"] == "preserved"
+            assert Path(info["path"]).exists()
+            assert archive_path.exists()
+            registered = real_run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=git_repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert f"worktree {archive_path}" not in registered
+        finally:
+            if archive_path.exists():
+                archive_path.rmdir()
+            _force_remove_worktree(info)
+
+    def test_unregistered_archive_destination_is_not_reported_as_archived(
+        self,
+        git_repo,
+        monkeypatch,
+    ):
+        import cli as cli_mod
+
+        info = cli_mod._setup_worktree(str(git_repo), sync_base=False)
+        assert info is not None
+        source_path = Path(info["path"])
+        archive_path = git_repo / ".worktrees" / ".archive" / source_path.name
+        real_run = subprocess.run
+
+        def rename_without_git_registration(args, **kwargs):
+            if args[1:3] == ["worktree", "move"]:
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.rename(archive_path)
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="injected unregistered rename",
+                )
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", rename_without_git_registration)
+        try:
+            outcome = cli_mod._archive_worktree_if_unchanged(
+                str(git_repo),
+                info["path"],
+                expected_branch=info["branch"],
+            )
+
+            assert outcome["status"] == "preserved"
+            assert outcome["reason"] == "archive_destination_not_registered"
+            assert not source_path.exists()
+            assert archive_path.exists()
+        finally:
+            if archive_path.exists() and not source_path.exists():
+                archive_path.rename(source_path)
+            _force_remove_worktree(info)
+
     def test_last_moment_self_ignoring_payload_is_archived(
         self,
         git_repo,

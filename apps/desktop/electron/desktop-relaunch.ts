@@ -63,6 +63,11 @@ export interface RelaunchResult {
   reason: string
 }
 
+export interface GracefulRelaunchCoordinator {
+  (): Promise<RelaunchResult>
+  readonly relaunchIssued: boolean
+}
+
 export interface DesktopRelaunchLifecycle {
   readonly active: boolean
   readonly draining: boolean
@@ -71,10 +76,12 @@ export interface DesktopRelaunchLifecycle {
   markRelaunching: () => void
   request: () => Promise<RelaunchResult>
   runOperation: <T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) => Promise<T>
+  runRecoveryOperation: <T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) => Promise<T>
 }
 
 interface DesktopRelaunchLifecycleOptions {
   isHandoffActive?: () => boolean
+  isRelaunchPending?: () => boolean
 }
 
 export interface DesktopStartupFence {
@@ -146,6 +153,56 @@ export function createDesktopRelaunchLifecycle(
   let inFlight: Promise<RelaunchResult> | null = null
   let operationCount = 0
   const handoffActive = () => options.isHandoffActive?.() === true
+  const relaunchPending = () => options.isRelaunchPending?.() === true
+
+  const runLeasedOperation = <T>(
+    operation: string,
+    callback: (assertActive: () => void) => Promise<T> | T,
+    allowRelaunchPending: boolean
+  ): Promise<T> => {
+    if (handoffActive()) {
+      return Promise.reject(new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`))
+    }
+
+    if (!allowRelaunchPending && relaunchPending()) {
+      return Promise.reject(new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`))
+    }
+
+    if (phase !== 'idle') {
+      return Promise.reject(new Error(`Hermes Desktop is relaunching; ${operation} is blocked.`))
+    }
+
+    if (operationCount > 0) {
+      return Promise.reject(new Error(`Another Hermes Desktop lifecycle operation is active; ${operation} is blocked.`))
+    }
+
+    operationCount += 1
+
+    const assertActive = () => {
+      if (
+        handoffActive() ||
+        (!allowRelaunchPending && relaunchPending()) ||
+        phase !== 'idle' ||
+        operationCount !== 1
+      ) {
+        throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
+      }
+    }
+
+    let result: Promise<T> | T
+
+    try {
+      result = callback(assertActive)
+    } catch (error) {
+      operationCount -= 1
+
+      return Promise.reject(error)
+    }
+
+    return Promise.resolve(result).finally(() => {
+      operationCount -= 1
+    })
+  }
 
   return {
     get active() {
@@ -157,6 +214,10 @@ export function createDesktopRelaunchLifecycle(
     assertOperationAllowed(operation: string) {
       if (handoffActive()) {
         throw new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`)
+      }
+
+      if (relaunchPending()) {
+        throw new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`)
       }
 
       if (phase !== 'idle') {
@@ -220,39 +281,10 @@ export function createDesktopRelaunchLifecycle(
       return inFlight
     },
     runOperation<T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) {
-      if (handoffActive()) {
-        return Promise.reject(new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`))
-      }
-
-      if (phase !== 'idle') {
-        return Promise.reject(new Error(`Hermes Desktop is relaunching; ${operation} is blocked.`))
-      }
-
-      if (operationCount > 0) {
-        return Promise.reject(new Error(`Another Hermes Desktop lifecycle operation is active; ${operation} is blocked.`))
-      }
-
-      operationCount += 1
-
-      const assertActive = () => {
-        if (handoffActive() || phase !== 'idle' || operationCount !== 1) {
-          throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
-        }
-      }
-
-      let result: Promise<T> | T
-
-      try {
-        result = callback(assertActive)
-      } catch (error) {
-        operationCount -= 1
-
-        return Promise.reject(error)
-      }
-
-      return Promise.resolve(result).finally(() => {
-        operationCount -= 1
-      })
+      return runLeasedOperation(operation, callback, false)
+    },
+    runRecoveryOperation<T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) {
+      return runLeasedOperation(operation, callback, true)
     }
   }
 }
@@ -373,6 +405,38 @@ export async function runOperationWithPostRelease<T>(
   return result
 }
 
+export async function requestRelaunchWithRecovery(
+  lifecycle: Pick<DesktopRelaunchLifecycle, 'request' | 'runRecoveryOperation'>,
+  recover: (assertActive: () => void) => Promise<void> | void
+): Promise<RelaunchResult> {
+  const result = await lifecycle.request()
+
+  if (
+    !result.ok &&
+    (result.reason === 'relaunch-failed' || result.reason === 'quit-failed-after-relaunch')
+  ) {
+    await lifecycle.runRecoveryOperation('primary backend recovery', recover)
+  }
+
+  return result
+}
+
+export function runRelaunchQuitHandoff(options: {
+  markRelaunching: () => void
+  quit: () => void
+  setHandoffActive: (active: boolean) => void
+}): void {
+  options.markRelaunching()
+  options.setHandoffActive(true)
+
+  try {
+    options.quit()
+  } catch (error) {
+    options.setHandoffActive(false)
+    throw error
+  }
+}
+
 function childExitState(child: BackendChild | null): 'abnormal-exit' | 'exited' | 'running' {
   if (child == null || (child.exitCode === 0 && child.signalCode === null)) {
     return 'exited'
@@ -488,10 +552,11 @@ export async function requestBackendGroupShutdown(
   return { ok: results.every(result => result.ok), results }
 }
 
-export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOptions): () => Promise<RelaunchResult> {
+export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOptions): GracefulRelaunchCoordinator {
   let inFlight: Promise<RelaunchResult> | null = null
+  let relaunchIssued = false
 
-  return function requestRelaunch(): Promise<RelaunchResult> {
+  const requestRelaunch = function requestRelaunch(): Promise<RelaunchResult> {
     if (inFlight) {
       return inFlight
     }
@@ -517,10 +582,17 @@ export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOp
       }
 
       try {
-        options.relaunch()
+        if (!relaunchIssued) {
+          options.relaunch()
+          relaunchIssued = true
+        }
+
         options.quit()
       } catch {
-        return { ok: false, reason: 'relaunch-failed' }
+        return {
+          ok: false,
+          reason: relaunchIssued ? 'quit-failed-after-relaunch' : 'relaunch-failed'
+        }
       }
 
       return { ok: true, reason: 'relaunching' }
@@ -532,6 +604,13 @@ export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOp
 
     return inFlight
   }
+
+  Object.defineProperty(requestRelaunch, 'relaunchIssued', {
+    enumerable: true,
+    get: () => relaunchIssued
+  })
+
+  return requestRelaunch as GracefulRelaunchCoordinator
 }
 
 export { DEFAULT_BACKEND_SHUTDOWN_TIMEOUT_MS }
