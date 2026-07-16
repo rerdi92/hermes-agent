@@ -515,12 +515,24 @@ class TestWorktreeDirectorySymlink:
         src = git_repo / ".venv"
         dst = wt_path / ".venv"
 
-        # Manually symlink (mirrors cli.py logic)
+        # Mirror production include handling. Windows without Developer Mode or
+        # SeCreateSymbolicLinkPrivilege falls back to a recursive copy.
         if not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(str(src.resolve()), str(dst))
+            try:
+                os.symlink(str(src.resolve()), str(dst))
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    shutil.copytree(src, dst, symlinks=True)
+                else:
+                    raise
 
-        assert dst.is_symlink()
+        if os.name == "nt" and not dst.is_symlink():
+            # Windows without Developer Mode / symlink privilege uses the
+            # production copytree fallback while preserving included content.
+            assert dst.is_dir()
+        else:
+            assert dst.is_symlink()
         assert (dst / "lib" / "marker.txt").read_text() == "venv marker"
 
 
