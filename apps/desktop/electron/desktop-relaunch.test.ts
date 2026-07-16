@@ -503,8 +503,8 @@ test('quit failure recovers and retries without issuing a duplicate relaunch', a
   })
 
   const requestWithRecovery = () =>
-    requestRelaunchWithRecovery(lifecycle, async () => {
-      lifecycle.assertRelaunchNotActive('backend recovery')
+    requestRelaunchWithRecovery(lifecycle, async assertActive => {
+      assertActive()
       recoveries += 1
     })
 
@@ -542,8 +542,8 @@ test('relaunch publication failure recovers without a pending latch or quit', as
     isRelaunchPending: () => coordinate.relaunchIssued
   })
 
-  const result = await requestRelaunchWithRecovery(lifecycle, () => {
-    lifecycle.assertOperationAllowed('backend recovery')
+  const result = await requestRelaunchWithRecovery(lifecycle, assertActive => {
+    assertActive()
     recoveries += 1
   })
 
@@ -552,6 +552,50 @@ test('relaunch publication failure recovers without a pending latch or quit', as
   assert.equal(quitCalls, 0)
   assert.equal(recoveries, 1)
   assert.equal(lifecycle.active, false)
+  assert.doesNotThrow(() => lifecycle.assertOperationAllowed('update'))
+})
+
+test('relaunch publication failure recovery holds a real lease against competing operations', async () => {
+  let releaseRecovery: (() => void) | undefined
+  let signalRecoveryStarted: (() => void) | undefined
+
+  const recoveryGate = new Promise<void>(resolve => {
+    releaseRecovery = resolve
+  })
+  const recoveryStarted = new Promise<void>(resolve => {
+    signalRecoveryStarted = resolve
+  })
+  const coordinate = createGracefulRelaunchCoordinator({
+    getTargets: () => [],
+    preflight: () => ({ ok: true as const }),
+    quit: () => undefined,
+    relaunch: () => {
+      throw new Error('synthetic relaunch failure')
+    },
+    shutdownTargets: async () => ({ ok: true as const, results: [] })
+  })
+  const lifecycle = createDesktopRelaunchLifecycle(coordinate, {
+    isRelaunchPending: () => coordinate.relaunchIssued
+  })
+
+  const request = requestRelaunchWithRecovery(lifecycle, async assertActive => {
+    signalRecoveryStarted?.()
+    await recoveryGate
+    assertActive()
+  })
+  await recoveryStarted
+
+  let competingError: unknown
+  try {
+    await lifecycle.runOperation('update', async () => undefined)
+  } catch (error) {
+    competingError = error
+  } finally {
+    releaseRecovery?.()
+  }
+
+  assert.match(String(competingError), /operation is active/)
+  assert.deepEqual(await request, { ok: false, reason: 'relaunch-failed' })
   assert.doesNotThrow(() => lifecycle.assertOperationAllowed('update'))
 })
 

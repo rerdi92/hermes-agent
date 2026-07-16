@@ -76,6 +76,7 @@ export interface DesktopRelaunchLifecycle {
   markRelaunching: () => void
   request: () => Promise<RelaunchResult>
   runOperation: <T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) => Promise<T>
+  runRecoveryOperation: <T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) => Promise<T>
 }
 
 interface DesktopRelaunchLifecycleOptions {
@@ -154,6 +155,55 @@ export function createDesktopRelaunchLifecycle(
   const handoffActive = () => options.isHandoffActive?.() === true
   const relaunchPending = () => options.isRelaunchPending?.() === true
 
+  const runLeasedOperation = <T>(
+    operation: string,
+    callback: (assertActive: () => void) => Promise<T> | T,
+    allowRelaunchPending: boolean
+  ): Promise<T> => {
+    if (handoffActive()) {
+      return Promise.reject(new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`))
+    }
+
+    if (!allowRelaunchPending && relaunchPending()) {
+      return Promise.reject(new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`))
+    }
+
+    if (phase !== 'idle') {
+      return Promise.reject(new Error(`Hermes Desktop is relaunching; ${operation} is blocked.`))
+    }
+
+    if (operationCount > 0) {
+      return Promise.reject(new Error(`Another Hermes Desktop lifecycle operation is active; ${operation} is blocked.`))
+    }
+
+    operationCount += 1
+
+    const assertActive = () => {
+      if (
+        handoffActive() ||
+        (!allowRelaunchPending && relaunchPending()) ||
+        phase !== 'idle' ||
+        operationCount !== 1
+      ) {
+        throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
+      }
+    }
+
+    let result: Promise<T> | T
+
+    try {
+      result = callback(assertActive)
+    } catch (error) {
+      operationCount -= 1
+
+      return Promise.reject(error)
+    }
+
+    return Promise.resolve(result).finally(() => {
+      operationCount -= 1
+    })
+  }
+
   return {
     get active() {
       return phase !== 'idle'
@@ -231,43 +281,10 @@ export function createDesktopRelaunchLifecycle(
       return inFlight
     },
     runOperation<T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) {
-      if (handoffActive()) {
-        return Promise.reject(new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`))
-      }
-
-      if (relaunchPending()) {
-        return Promise.reject(new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`))
-      }
-
-      if (phase !== 'idle') {
-        return Promise.reject(new Error(`Hermes Desktop is relaunching; ${operation} is blocked.`))
-      }
-
-      if (operationCount > 0) {
-        return Promise.reject(new Error(`Another Hermes Desktop lifecycle operation is active; ${operation} is blocked.`))
-      }
-
-      operationCount += 1
-
-      const assertActive = () => {
-        if (handoffActive() || relaunchPending() || phase !== 'idle' || operationCount !== 1) {
-          throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
-        }
-      }
-
-      let result: Promise<T> | T
-
-      try {
-        result = callback(assertActive)
-      } catch (error) {
-        operationCount -= 1
-
-        return Promise.reject(error)
-      }
-
-      return Promise.resolve(result).finally(() => {
-        operationCount -= 1
-      })
+      return runLeasedOperation(operation, callback, false)
+    },
+    runRecoveryOperation<T>(operation: string, callback: (assertActive: () => void) => Promise<T> | T) {
+      return runLeasedOperation(operation, callback, true)
     }
   }
 }
@@ -389,8 +406,8 @@ export async function runOperationWithPostRelease<T>(
 }
 
 export async function requestRelaunchWithRecovery(
-  lifecycle: Pick<DesktopRelaunchLifecycle, 'request'>,
-  recover: () => Promise<void> | void
+  lifecycle: Pick<DesktopRelaunchLifecycle, 'request' | 'runRecoveryOperation'>,
+  recover: (assertActive: () => void) => Promise<void> | void
 ): Promise<RelaunchResult> {
   const result = await lifecycle.request()
 
@@ -398,7 +415,7 @@ export async function requestRelaunchWithRecovery(
     !result.ok &&
     (result.reason === 'relaunch-failed' || result.reason === 'quit-failed-after-relaunch')
   ) {
-    await recover()
+    await lifecycle.runRecoveryOperation('primary backend recovery', recover)
   }
 
   return result
