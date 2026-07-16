@@ -63,6 +63,11 @@ export interface RelaunchResult {
   reason: string
 }
 
+export interface GracefulRelaunchCoordinator {
+  (): Promise<RelaunchResult>
+  readonly relaunchIssued: boolean
+}
+
 export interface DesktopRelaunchLifecycle {
   readonly active: boolean
   readonly draining: boolean
@@ -75,6 +80,7 @@ export interface DesktopRelaunchLifecycle {
 
 interface DesktopRelaunchLifecycleOptions {
   isHandoffActive?: () => boolean
+  isRelaunchPending?: () => boolean
 }
 
 export interface DesktopStartupFence {
@@ -146,6 +152,7 @@ export function createDesktopRelaunchLifecycle(
   let inFlight: Promise<RelaunchResult> | null = null
   let operationCount = 0
   const handoffActive = () => options.isHandoffActive?.() === true
+  const relaunchPending = () => options.isRelaunchPending?.() === true
 
   return {
     get active() {
@@ -157,6 +164,10 @@ export function createDesktopRelaunchLifecycle(
     assertOperationAllowed(operation: string) {
       if (handoffActive()) {
         throw new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`)
+      }
+
+      if (relaunchPending()) {
+        throw new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`)
       }
 
       if (phase !== 'idle') {
@@ -224,6 +235,10 @@ export function createDesktopRelaunchLifecycle(
         return Promise.reject(new Error(`Hermes Desktop handoff is active; ${operation} is blocked.`))
       }
 
+      if (relaunchPending()) {
+        return Promise.reject(new Error(`Hermes Desktop restart is already scheduled; ${operation} is blocked.`))
+      }
+
       if (phase !== 'idle') {
         return Promise.reject(new Error(`Hermes Desktop is relaunching; ${operation} is blocked.`))
       }
@@ -235,7 +250,7 @@ export function createDesktopRelaunchLifecycle(
       operationCount += 1
 
       const assertActive = () => {
-        if (handoffActive() || phase !== 'idle' || operationCount !== 1) {
+        if (handoffActive() || relaunchPending() || phase !== 'idle' || operationCount !== 1) {
           throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
         }
       }
@@ -379,7 +394,10 @@ export async function requestRelaunchWithRecovery(
 ): Promise<RelaunchResult> {
   const result = await lifecycle.request()
 
-  if (!result.ok && result.reason === 'relaunch-failed') {
+  if (
+    !result.ok &&
+    (result.reason === 'relaunch-failed' || result.reason === 'quit-failed-after-relaunch')
+  ) {
     await recover()
   }
 
@@ -517,10 +535,11 @@ export async function requestBackendGroupShutdown(
   return { ok: results.every(result => result.ok), results }
 }
 
-export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOptions): () => Promise<RelaunchResult> {
+export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOptions): GracefulRelaunchCoordinator {
   let inFlight: Promise<RelaunchResult> | null = null
+  let relaunchIssued = false
 
-  return function requestRelaunch(): Promise<RelaunchResult> {
+  const requestRelaunch = function requestRelaunch(): Promise<RelaunchResult> {
     if (inFlight) {
       return inFlight
     }
@@ -546,10 +565,17 @@ export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOp
       }
 
       try {
-        options.relaunch()
+        if (!relaunchIssued) {
+          options.relaunch()
+          relaunchIssued = true
+        }
+
         options.quit()
       } catch {
-        return { ok: false, reason: 'relaunch-failed' }
+        return {
+          ok: false,
+          reason: relaunchIssued ? 'quit-failed-after-relaunch' : 'relaunch-failed'
+        }
       }
 
       return { ok: true, reason: 'relaunching' }
@@ -561,6 +587,13 @@ export function createGracefulRelaunchCoordinator(options: RelaunchCoordinatorOp
 
     return inFlight
   }
+
+  Object.defineProperty(requestRelaunch, 'relaunchIssued', {
+    enumerable: true,
+    get: () => relaunchIssued
+  })
+
+  return requestRelaunch as GracefulRelaunchCoordinator
 }
 
 export { DEFAULT_BACKEND_SHUTDOWN_TIMEOUT_MS }
