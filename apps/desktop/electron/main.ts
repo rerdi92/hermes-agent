@@ -6544,11 +6544,11 @@ async function requestGracefulDesktopRelaunch() {
   let result
 
   try {
-    result = await requestRelaunchWithRecovery(gracefulDesktopRelaunch, async () => {
+    result = await requestRelaunchWithRecovery(gracefulDesktopRelaunch, async assertActive => {
       rememberLog('[relaunch] relaunch handoff failed after backend drain; recovering the primary backend')
 
       try {
-        await startHermes(() => gracefulDesktopRelaunch.assertRelaunchNotActive('backend recovery'))
+        await startHermes(assertActive)
       } catch (error) {
         rememberLog(`[relaunch] primary backend recovery failed: ${error.message}`)
       }
