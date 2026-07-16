@@ -1831,6 +1831,36 @@ def _capture_worktree_branch_snapshot(
         return None
 
 
+def _worktree_registration_state(
+    repo_root: str,
+    worktree_path: str,
+    timeout: int = 10,
+) -> Optional[bool]:
+    """Return whether an exact path is registered, or None if unprovable."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout, cwd=repo_root,
+        )
+        if result.returncode != 0:
+            return None
+        target = Path(worktree_path).resolve()
+        for line in result.stdout.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            try:
+                registered = Path(line[len("worktree "):].strip()).resolve()
+            except Exception:
+                return None
+            if registered == target:
+                return True
+        return False
+    except Exception:
+        return None
+
+
 def _archive_worktree_if_unchanged(
     repo_root: str,
     worktree_path: str,
@@ -1899,16 +1929,33 @@ def _archive_worktree_if_unchanged(
 
     source_exists = Path(worktree_path).exists()
     archive_exists = archive_path.exists()
-    if archive_exists:
+    archive_registered = (
+        _worktree_registration_state(repo_root, str(archive_path), timeout=timeout)
+        if archive_exists
+        else False
+    )
+    if archive_exists and not source_exists and archive_registered is True:
         reason = "move_success"
         if move_result is None:
-            reason = "move_exception_archive_present"
+            reason = "move_exception_archive_registered"
         elif move_result.returncode != 0:
-            reason = "move_nonzero_archive_present"
-        elif source_exists:
-            reason = "move_success_residual_source"
+            reason = "move_nonzero_archive_registered"
         return {
             "status": "archived_branch_preserved",
+            "reason": reason,
+            "branch": branch,
+            "path": str(archive_path),
+        }
+
+    if archive_exists:
+        if source_exists:
+            reason = "archive_move_uncertain_source_present"
+        elif archive_registered is None:
+            reason = "archive_registration_failure"
+        else:
+            reason = "archive_destination_not_registered"
+        return {
+            "status": "preserved",
             "reason": reason,
             "branch": branch,
             "path": str(archive_path),
