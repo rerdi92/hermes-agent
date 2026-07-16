@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MessagingPlatformInfo } from '@/types/hermes'
+
+import type { MessagingView as MessagingViewComponent } from './index'
 
 const { getMessagingPlatforms, openExternalLink, updateMessagingPlatform } = vi.hoisted(() => ({
   getMessagingPlatforms: vi.fn(),
@@ -28,6 +30,12 @@ vi.mock('@/store/notifications', () => ({
 vi.mock('@/store/system-actions', () => ({
   runGatewayRestart: vi.fn()
 }))
+
+let MessagingView: typeof MessagingViewComponent
+
+beforeAll(async () => {
+  ;({ MessagingView } = await import('./index'))
+}, 30_000)
 
 function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatformInfo {
   return {
@@ -54,7 +62,6 @@ afterEach(() => {
 })
 
 async function renderMessaging() {
-  const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
