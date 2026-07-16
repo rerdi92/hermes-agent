@@ -6535,7 +6535,8 @@ const coordinateGracefulDesktopRelaunch = createGracefulRelaunchCoordinator({
   shutdownTargets: targets => requestBackendGroupShutdown(targets)
 })
 const gracefulDesktopRelaunch = createDesktopRelaunchLifecycle(coordinateGracefulDesktopRelaunch, {
-  isHandoffActive: () => isQuittingForHandoff
+  isHandoffActive: () => isQuittingForHandoff,
+  isRelaunchPending: () => coordinateGracefulDesktopRelaunch.relaunchIssued
 })
 const primaryStartupFence = createDesktopStartupFence(gracefulDesktopRelaunch)
 
@@ -6547,7 +6548,7 @@ async function requestGracefulDesktopRelaunch() {
       rememberLog('[relaunch] relaunch handoff failed after backend drain; recovering the primary backend')
 
       try {
-        await startHermes()
+        await startHermes(() => gracefulDesktopRelaunch.assertRelaunchNotActive('backend recovery'))
       } catch (error) {
         rememberLog(`[relaunch] primary backend recovery failed: ${error.message}`)
       }
@@ -6589,7 +6590,9 @@ async function requestGracefulDesktopRelaunchWithFeedback() {
                 ? 'Wait for the backend connection to finish starting, then try again. Hermes did not quit.'
                 : result.reason === 'backend-drain-failed'
                   ? 'A local backend did not exit cleanly before the deadline. Hermes did not quit or force-kill it.'
-                  : 'Hermes could not schedule a safe relaunch and remained open.'
+                  : result.reason === 'quit-failed-after-relaunch'
+                    ? 'A restart is already scheduled, but Hermes could not quit. The backend was recovered; try Restart Hermes again to finish without scheduling another instance.'
+                    : 'Hermes could not schedule a safe relaunch and remained open.'
 
   await dialog.showMessageBox({
     type: 'warning',
