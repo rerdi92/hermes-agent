@@ -373,6 +373,35 @@ export async function runOperationWithPostRelease<T>(
   return result
 }
 
+export async function requestRelaunchWithRecovery(
+  lifecycle: Pick<DesktopRelaunchLifecycle, 'request'>,
+  recover: () => Promise<void> | void
+): Promise<RelaunchResult> {
+  const result = await lifecycle.request()
+
+  if (!result.ok && result.reason === 'relaunch-failed') {
+    await recover()
+  }
+
+  return result
+}
+
+export function runRelaunchQuitHandoff(options: {
+  markRelaunching: () => void
+  quit: () => void
+  setHandoffActive: (active: boolean) => void
+}): void {
+  options.markRelaunching()
+  options.setHandoffActive(true)
+
+  try {
+    options.quit()
+  } catch (error) {
+    options.setHandoffActive(false)
+    throw error
+  }
+}
+
 function childExitState(child: BackendChild | null): 'abnormal-exit' | 'exited' | 'running' {
   if (child == null || (child.exitCode === 0 && child.signalCode === null)) {
     return 'exited'

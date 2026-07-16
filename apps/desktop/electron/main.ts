@@ -64,7 +64,9 @@ import {
   invalidateDesktopOwnedStartupEntry,
   isBackendChildRunning,
   requestBackendGroupShutdown,
-  runOperationWithPostRelease
+  requestRelaunchWithRecovery,
+  runOperationWithPostRelease,
+  runRelaunchQuitHandoff
 } from './desktop-relaunch'
 import {
   buildPosixCleanupScript,
@@ -6616,11 +6618,14 @@ function gracefulDesktopRelaunchPreflight() {
 const coordinateGracefulDesktopRelaunch = createGracefulRelaunchCoordinator({
   getTargets: ownedBackendShutdownTargets,
   preflight: gracefulDesktopRelaunchPreflight,
-  quit: () => {
-    gracefulDesktopRelaunch.markRelaunching()
-    isQuittingForHandoff = true
-    app.quit()
-  },
+  quit: () =>
+    runRelaunchQuitHandoff({
+      markRelaunching: () => gracefulDesktopRelaunch.markRelaunching(),
+      quit: () => app.quit(),
+      setHandoffActive: active => {
+        isQuittingForHandoff = active
+      }
+    }),
   relaunch: () => app.relaunch(),
   shutdownTargets: targets => requestBackendGroupShutdown(targets)
 })
@@ -6633,7 +6638,15 @@ async function requestGracefulDesktopRelaunch() {
   let result
 
   try {
-    result = await gracefulDesktopRelaunch.request()
+    result = await requestRelaunchWithRecovery(gracefulDesktopRelaunch, async () => {
+      rememberLog('[relaunch] relaunch handoff failed after backend drain; recovering the primary backend')
+
+      try {
+        await startHermes()
+      } catch (error) {
+        rememberLog(`[relaunch] primary backend recovery failed: ${error.message}`)
+      }
+    })
   } catch (error) {
     rememberLog(`[relaunch] unexpected graceful relaunch failure: ${error.message}`)
 

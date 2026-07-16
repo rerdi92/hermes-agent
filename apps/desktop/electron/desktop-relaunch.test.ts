@@ -14,7 +14,9 @@ import {
   invalidateDesktopOwnedStartupEntry,
   isBackendChildRunning,
   requestBackendShutdown,
+  requestRelaunchWithRecovery,
   runOperationWithPostRelease,
+  runRelaunchQuitHandoff,
 } from './desktop-relaunch'
 
 class FakeChild extends EventEmitter {
@@ -464,6 +466,57 @@ test('coordinator deduplicates concurrent requests and relaunches only after eve
   assert.equal(shutdownCalls, 1)
   assert.equal(relaunchCalls, 1)
   assert.equal(quitCalls, 1)
+})
+
+test('quit failure rolls back handoff, recovers after lease release, and permits retry', async () => {
+  let failQuit = true
+  let handoffActive = false
+  let recoveries = 0
+  let relaunchCalls = 0
+  let lifecycle: ReturnType<typeof createDesktopRelaunchLifecycle>
+
+  const coordinate = createGracefulRelaunchCoordinator({
+    getTargets: () => [],
+    preflight: () => ({ ok: true as const }),
+    quit: () =>
+      runRelaunchQuitHandoff({
+        markRelaunching: () => lifecycle.markRelaunching(),
+        quit: () => {
+          if (failQuit) {
+            failQuit = false
+            throw new Error('synthetic quit failure')
+          }
+        },
+        setHandoffActive: active => {
+          handoffActive = active
+        }
+      }),
+    relaunch: () => {
+      relaunchCalls += 1
+    },
+    shutdownTargets: async () => ({ ok: true as const, results: [] })
+  })
+
+  lifecycle = createDesktopRelaunchLifecycle(coordinate, {
+    isHandoffActive: () => handoffActive
+  })
+
+  const requestWithRecovery = () =>
+    requestRelaunchWithRecovery(lifecycle, async () => {
+      lifecycle.assertOperationAllowed('backend recovery')
+      recoveries += 1
+    })
+
+  assert.deepEqual(await requestWithRecovery(), { ok: false, reason: 'relaunch-failed' })
+  assert.equal(handoffActive, false)
+  assert.equal(lifecycle.active, false)
+  assert.equal(recoveries, 1)
+
+  assert.deepEqual(await requestWithRecovery(), { ok: true, reason: 'relaunching' })
+  assert.equal(handoffActive, true)
+  assert.equal(lifecycle.active, true)
+  assert.equal(recoveries, 1)
+  assert.equal(relaunchCalls, 2)
 })
 
 test('coordinator keeps the app open when preflight or backend drain fails', async () => {
