@@ -4690,7 +4690,13 @@ class AIAgent:
     # ── Unified streaming API call ─────────────────────────────────────────
 
     def _reset_stream_delivery_tracking(self) -> None:
-        """Reset tracking for text delivered during the current model response."""
+        """Atomically flush/reset stream delivery state against writer claims."""
+        self._ensure_stream_writer_state()
+        with self._stream_writer_lock:
+            self._reset_stream_delivery_tracking_locked()
+
+    def _reset_stream_delivery_tracking_locked(self) -> None:
+        """Reset tracking while the writer-order lock is held."""
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -4713,7 +4719,7 @@ class AIAgent:
                             cb(think_tail)
                         except Exception:
                             pass
-                    self._record_streamed_assistant_text(think_tail)
+                    self._record_streamed_assistant_text_locked(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -4727,15 +4733,19 @@ class AIAgent:
                         cb(tail)
                     except Exception:
                         pass
-                self._record_streamed_assistant_text(tail)
+                self._record_streamed_assistant_text_locked(tail)
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
+        self._ensure_stream_writer_state()
+        with self._stream_writer_lock:
+            self._record_streamed_assistant_text_locked(text)
+
+    def _record_streamed_assistant_text_locked(self, text: str) -> None:
+        """Accumulate text while the writer-order lock is already held."""
+        # A superseded stream must not pollute accumulated visible text,
+        # including direct callers that bypass _fire_stream_delta.
         if self._stream_writer_superseded():
             return
         if isinstance(text, str) and text:
@@ -4909,7 +4919,7 @@ class AIAgent:
         those agents, so initialize the fields on first use.
         """
         if getattr(self, "_stream_writer_lock", None) is None:
-            self._stream_writer_lock = threading.Lock()
+            self._stream_writer_lock = threading.RLock()
         if not hasattr(self, "_stream_writer_token"):
             self._stream_writer_token = 0
         if getattr(self, "_stream_writer_tls", None) is None:
@@ -4977,6 +4987,15 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        self._ensure_stream_writer_state()
+        # Claim and external callback emission must have one total order. A
+        # newer claim cannot overtake after the stale check and then be followed
+        # by an older callback.
+        with self._stream_writer_lock:
+            self._fire_stream_delta_locked(text)
+
+    def _fire_stream_delta_locked(self, text: str) -> None:
+        """Emit one text delta while the writer-order lock is held."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -5031,10 +5050,16 @@ class AIAgent:
             except Exception:
                 pass
         if delivered:
-            self._record_streamed_assistant_text(text)
+            self._record_streamed_assistant_text_locked(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        self._ensure_stream_writer_state()
+        with self._stream_writer_lock:
+            self._fire_reasoning_delta_locked(text)
+
+    def _fire_reasoning_delta_locked(self, text: str) -> None:
+        """Emit one reasoning delta while the writer-order lock is held."""
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
