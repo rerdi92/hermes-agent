@@ -107,6 +107,51 @@ class TestRuntimeFtsRebuild:
         with pytest.raises(sqlite3.DatabaseError):
             db.append_message("s1", "user", "second corruption")
 
+    def test_concurrent_repair_waiter_joins_the_single_rebuild(self, db):
+        """A direct writer failing during an in-flight repair waits and retries."""
+        import threading
+
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        rebuild_entered = threading.Event()
+        release_rebuild = threading.Event()
+        rebuild_calls = []
+        results = []
+        errors = []
+
+        def blocking_rebuild():
+            rebuild_calls.append(1)
+            rebuild_entered.set()
+            assert release_rebuild.wait(timeout=2)
+            return 1
+
+        db.rebuild_fts = blocking_rebuild
+        corruption = sqlite3.DatabaseError("database disk image is malformed")
+        observed_generation = db._fts_runtime_rebuild_generation
+
+        def repair():
+            try:
+                results.append(db._try_runtime_fts_rebuild(
+                    corruption,
+                    observed_generation=observed_generation,
+                ))
+            except Exception as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        winner = threading.Thread(target=repair)
+        loser = threading.Thread(target=repair)
+        winner.start()
+        assert rebuild_entered.wait(timeout=2)
+        loser.start()
+        release_rebuild.set()
+        winner.join(timeout=2)
+        loser.join(timeout=2)
+
+        assert errors == []
+        assert not winner.is_alive() and not loser.is_alive()
+        assert rebuild_calls == [1]
+        assert sorted(results) == [True, True]
+
     def test_non_fts_errors_still_propagate(self, db):
         db.create_session("s1", source="test")
 

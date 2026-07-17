@@ -1022,6 +1022,10 @@ class SessionDB:
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        self._fts_runtime_rebuild_condition = threading.Condition()
+        self._fts_runtime_rebuild_in_progress = False
+        self._fts_runtime_rebuild_generation = 0
+        self._fts_runtime_rebuild_succeeded = False
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
@@ -1271,6 +1275,10 @@ class SessionDB:
         """
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
+            with self._fts_runtime_rebuild_condition:
+                observed_fts_rebuild_generation = (
+                    self._fts_runtime_rebuild_generation
+                )
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -1313,7 +1321,10 @@ class SessionDB:
                 # until the next process restart triggers the offline repair.
                 # Rebuild the FTS index in place (once per instance) via
                 # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
+                if not self._try_runtime_fts_rebuild(
+                    exc,
+                    observed_generation=observed_fts_rebuild_generation,
+                ):
                     raise
                 continue
         # Retries exhausted (shouldn't normally reach here).
@@ -1337,7 +1348,12 @@ class SessionDB:
         msg = str(exc).lower()
         return "fts5" in msg and "corrupt" in msg
 
-    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
+    def _try_runtime_fts_rebuild(
+        self,
+        exc: sqlite3.DatabaseError,
+        *,
+        observed_generation: Optional[int] = None,
+    ) -> bool:
         """One-shot in-place FTS rebuild after a corrupt-index write failure.
 
         Returns True when a rebuild was performed and the failed write should
@@ -1353,18 +1369,38 @@ class SessionDB:
         every append; after the in-place rebuild the same append succeeds and
         search works again.
         """
-        if self._fts_runtime_rebuild_attempted:
-            return False
         if not self._fts_enabled:
             return False
         if not self._is_fts_write_corruption_error(exc):
             return False
-        self._fts_runtime_rebuild_attempted = True
+        condition = self._fts_runtime_rebuild_condition
+        with condition:
+            current_generation = self._fts_runtime_rebuild_generation
+            baseline_generation = (
+                current_generation
+                if observed_generation is None
+                else observed_generation
+            )
+            if current_generation > baseline_generation:
+                return self._fts_runtime_rebuild_succeeded
+            if self._fts_runtime_rebuild_in_progress:
+                while self._fts_runtime_rebuild_in_progress:
+                    condition.wait()
+                return (
+                    self._fts_runtime_rebuild_generation > baseline_generation
+                    and self._fts_runtime_rebuild_succeeded
+                )
+            if self._fts_runtime_rebuild_attempted:
+                return False
+            self._fts_runtime_rebuild_attempted = True
+            self._fts_runtime_rebuild_in_progress = True
         logger.warning(
             "state.db write failed with an FTS-corruption error (%s) — "
             "attempting one-shot in-place FTS rebuild; canonical message "
             "rows are preserved.", exc,
         )
+        rebuilt = None
+        succeeded = False
         try:
             rebuilt = self.rebuild_fts()
         except Exception as rebuild_exc:
@@ -1373,18 +1409,24 @@ class SessionDB:
                 "full offline repair path (repair_state_db_schema).",
                 rebuild_exc,
             )
-            return False
-        if not rebuilt:
+        else:
+            succeeded = bool(rebuilt)
+        if rebuilt is not None and not rebuilt:
             logger.error(
                 "In-place FTS rebuild made no progress; the database needs "
                 "the full offline repair path (repair_state_db_schema)."
             )
-            return False
-        logger.warning(
-            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
-            rebuilt,
-        )
-        return True
+        if succeeded:
+            logger.warning(
+                "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
+                rebuilt,
+            )
+        with condition:
+            self._fts_runtime_rebuild_generation += 1
+            self._fts_runtime_rebuild_succeeded = succeeded
+            self._fts_runtime_rebuild_in_progress = False
+            condition.notify_all()
+        return succeeded
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
