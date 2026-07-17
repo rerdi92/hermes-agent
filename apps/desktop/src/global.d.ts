@@ -21,6 +21,7 @@ declare global {
       // self-heal via the child 'exit' handler). `rebuilt` is true when a stale
       // remote cache was dropped.
       revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
+      restartDesktop: () => Promise<{ ok: boolean; reason: string }>
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
@@ -70,6 +71,11 @@ declare global {
         // backend under the new HERMES_HOME (reloads the window). Pass null to
         // clear the preference.
         set: (name: string | null) => Promise<DesktopActiveProfile>
+      }
+      pinnedSessions: {
+        get: () => Promise<DesktopPinnedSessions>
+        set: (ids: string[]) => Promise<DesktopPinnedSessions>
+        onChanged: (callback: (payload: DesktopPinnedSessions) => void) => () => void
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
@@ -412,6 +418,12 @@ export interface DesktopActiveProfile {
   // The desktop's stored profile preference, or null when unset (legacy launch
   // that defers to the sticky active_profile / default).
   profile: string | null
+}
+
+export interface DesktopPinnedSessions {
+  exists: boolean
+  ids: string[]
+  path: string
 }
 
 export interface DesktopConnectionConfig {
