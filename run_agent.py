@@ -5052,6 +5052,37 @@ class AIAgent:
         if delivered:
             self._record_streamed_assistant_text_locked(text)
 
+    def _fire_tool_suppressed_stream_delta(self, text: str) -> None:
+        """Emit raw tool-suppressed content under the writer-order fence.
+
+        This deliberately bypasses the normal think/context scrubbers so the
+        callback can extract embedded reasoning tags exactly as before.  The
+        stale check and externally visible callback are nevertheless atomic
+        relative to a newer stream claim.
+        """
+        self._ensure_stream_writer_state()
+        with self._stream_writer_lock:
+            if self._stream_writer_superseded():
+                self._note_dropped_stream_writer(
+                    "_fire_tool_suppressed_stream_delta"
+                )
+                return
+            writer_token = getattr(self._stream_writer_tls, "token", None)
+            if not self.stream_delta_callback:
+                return
+            try:
+                self.stream_delta_callback(text)
+            except Exception:
+                return
+            # A callback may re-enter and claim a newer writer through the
+            # RLock. The old callback already happened before that claim, but
+            # its text must not be accumulated into the replacement stream.
+            if writer_token is not None and not self._stream_writer_is_current(
+                writer_token
+            ):
+                return
+            self._record_streamed_assistant_text_locked(text)
+
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
         self._ensure_stream_writer_state()

@@ -36,6 +36,19 @@ def _chunk(content=None, finish_reason=None, model=None):
     return SimpleNamespace(choices=[choice], model=model, usage=None)
 
 
+def _tool_chunk(name=None, arguments=None, finish_reason=None, model=None):
+    function = SimpleNamespace(name=name, arguments=arguments)
+    tool_call = SimpleNamespace(index=0, id="call_1", function=function)
+    delta = SimpleNamespace(
+        content=None,
+        tool_calls=[tool_call],
+        reasoning_content=None,
+        reasoning=None,
+    )
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model=model, usage=None)
+
+
 class TestSingleWriterSink:
     def test_new_claim_cannot_overtake_checked_emission(self):
         """Claim and callback emission have one total order.
@@ -188,6 +201,75 @@ class TestSingleWriterLoop:
 
         assert "".join(delivered) == "first"
         assert "-stale-tail" not in "".join(delivered)
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_suppressed_raw_callback_rechecks_writer_under_emission_lock(
+        self, _close, mock_create
+    ):
+        """A claim after the loop check fences the raw tool-suppressed callback."""
+        agent = _make_agent()
+        delivered = []
+        agent.stream_delta_callback = lambda text: delivered.append(text)
+        agent._stream_callback = None
+        old_after_loop_check = threading.Event()
+        release_old = threading.Event()
+        errors = []
+
+        class BlockingSuppressedDelta:
+            tool_calls = None
+            reasoning_content = None
+            reasoning = None
+
+            def __init__(self):
+                self._reads = 0
+
+            @property
+            def content(self):
+                self._reads += 1
+                if self._reads == 1:
+                    old_after_loop_check.set()
+                    assert release_old.wait(timeout=2)
+                return "old-suppressed"
+
+        def stream_gen():
+            # Establish tool_calls_acc so subsequent content takes the raw,
+            # tag-preserving callback branch rather than _fire_stream_delta.
+            yield _tool_chunk(name="write_file", arguments="{}")
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(
+                    index=0,
+                    delta=BlockingSuppressedDelta(),
+                    finish_reason=None,
+                )],
+                model="m",
+                usage=None,
+            )
+            yield _chunk(finish_reason="tool_calls", model="m")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream_gen()
+        mock_create.return_value = mock_client
+
+        def old_writer():
+            try:
+                agent._interruptible_streaming_api_call({})
+            except Exception as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        old = threading.Thread(target=old_writer)
+        old.start()
+        assert old_after_loop_check.wait(timeout=2)
+        # Supersede after the consume-loop check but before the raw callback.
+        agent._claim_stream_writer()
+        agent._fire_stream_delta("new")
+        release_old.set()
+        old.join(timeout=3)
+
+        assert not old.is_alive()
+        assert errors == []
+        assert delivered == ["new"]
+        assert "old-suppressed" not in agent._current_streamed_assistant_text
 
 
 class TestCodexSingleWriter:
