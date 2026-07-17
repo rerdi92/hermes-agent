@@ -1791,6 +1791,73 @@ class TestGatewaySessionDbRecovery:
         assert db.persisted == ["only"]
         assert "s1" not in store._dirty_transcripts
 
+    def test_concurrent_fts_repair_waiters_retry_both_session_heads(self):
+        """A losing session joins the in-flight repair instead of stranding its head."""
+        import threading
+
+        class FakeDb:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.failed_sessions = set()
+                self.both_failed = threading.Event()
+                self.rebuild_started = threading.Event()
+                self.release_rebuild = threading.Event()
+                self.attempts = []
+                self.persisted = []
+                self.rebuild_calls = 0
+
+            def rebuild_fts(self):
+                with self.lock:
+                    self.rebuild_calls += 1
+                assert self.both_failed.wait(timeout=2)
+                self.rebuild_started.set()
+                assert self.release_rebuild.wait(timeout=2)
+                return 1
+
+            def append_message(self, **kwargs):
+                session_id = kwargs["session_id"]
+                content = kwargs["content"]
+                with self.lock:
+                    self.attempts.append((session_id, content))
+                    first_attempt = session_id not in self.failed_sessions
+                    if first_attempt:
+                        self.failed_sessions.add(session_id)
+                        if len(self.failed_sessions) == 2:
+                            self.both_failed.set()
+                if first_attempt:
+                    raise RuntimeError("database disk image is malformed")
+                with self.lock:
+                    self.persisted.append((session_id, content))
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        store._fts_rebuild_attempted = False
+        workers = [
+            threading.Thread(
+                target=store.append_to_transcript,
+                args=(session_id, {"role": "user", "content": session_id}),
+            )
+            for session_id in ("s1", "s2")
+        ]
+
+        for worker in workers:
+            worker.start()
+        assert db.rebuild_started.wait(timeout=2)
+        db.release_rebuild.set()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert db.rebuild_calls == 1
+        assert sorted(db.persisted) == [("s1", "s1"), ("s2", "s2")]
+        assert sorted(db.attempts) == [
+            ("s1", "s1"),
+            ("s1", "s1"),
+            ("s2", "s2"),
+            ("s2", "s2"),
+        ]
+        assert store._dirty_transcripts == {}
+
     def test_rewrite_waits_for_inflight_append_before_replacing(self):
         """A stale append already in flight cannot land after a rewrite."""
         import threading

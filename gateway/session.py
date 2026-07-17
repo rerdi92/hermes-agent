@@ -1033,6 +1033,10 @@ class SessionStore:
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
+        self._fts_rebuild_in_progress = False
+        self._fts_rebuild_generation = 0
+        self._fts_rebuild_last_succeeded = False
+        self._fts_rebuild_condition = threading.Condition(self._transcript_retry_lock)
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -2556,10 +2560,13 @@ class SessionStore:
         # DB write outside the retry lock — other sessions can append
         # concurrently. We re-acquire the lock only to update the queue.
         while True:
+            repair_generation = self._current_fts_rebuild_generation()
             try:
                 self._append_transcript_message(session_id, msg)
             except Exception as exc:
-                if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
+                if self._is_fts_corruption_error(exc) and self._rebuild_fts_once(
+                    observed_generation=repair_generation
+                ):
                     try:
                         self._append_transcript_message(session_id, msg)
                     except Exception as retry_exc:
@@ -2635,33 +2642,72 @@ class SessionStore:
             )
         )
 
-    def _rebuild_fts_once(self) -> bool:
+    def _current_fts_rebuild_generation(self) -> int:
+        """Snapshot the completed-repair generation before an append attempt."""
+        with self._transcript_retry_lock:
+            return int(getattr(self, "_fts_rebuild_generation", 0))
+
+    def _fts_rebuild_condition_locked(self) -> threading.Condition:
+        """Return the shared repair condition while retry lock is held."""
+        condition = getattr(self, "_fts_rebuild_condition", None)
+        if condition is None:
+            # Compatibility for narrowly-constructed test/store objects.
+            condition = threading.Condition(self._transcript_retry_lock)
+            self._fts_rebuild_condition = condition
+        return condition
+
+    def _rebuild_fts_once(self, *, observed_generation: Optional[int] = None) -> bool:
         """Attempt FTS5 ``rebuild`` command once per store lifetime.
 
         Delegates to ``SessionDB.rebuild_fts()`` which handles locking and
-        table-existence checks internally. Returns ``True`` when at least
-        one index was rebuilt.
+        table-existence checks internally. Concurrent append failures join an
+        in-flight repair and retry when that shared repair succeeds.
         """
-        # Reserve the single attempt atomically. The rebuild itself stays
-        # outside this lock because SessionDB owns its DB lock and may block.
         with self._transcript_retry_lock:
-            if self._fts_rebuild_attempted:
+            condition = self._fts_rebuild_condition_locked()
+            generation = int(getattr(self, "_fts_rebuild_generation", 0))
+            if observed_generation is None:
+                observed_generation = generation
+            # The append began before a successful repair completed. Its own
+            # failed head is now eligible for the same post-repair retry.
+            if generation > observed_generation:
+                return bool(getattr(self, "_fts_rebuild_last_succeeded", False))
+            if getattr(self, "_fts_rebuild_in_progress", False):
+                while getattr(self, "_fts_rebuild_in_progress", False):
+                    condition.wait()
+                return (
+                    int(getattr(self, "_fts_rebuild_generation", 0))
+                    > observed_generation
+                    and bool(getattr(self, "_fts_rebuild_last_succeeded", False))
+                )
+            if getattr(self, "_fts_rebuild_attempted", False):
                 return False
             self._fts_rebuild_attempted = True
+            self._fts_rebuild_in_progress = True
+
+        # The rebuild stays outside the retry lock because SessionDB owns its
+        # DB lock and may block. Completion is published to every waiter.
+        rebuilt = 0
         db = self._db
-        if db is None or not hasattr(db, "rebuild_fts"):
-            return False
-        try:
-            rebuilt = db.rebuild_fts()
-        except Exception as exc:
-            logger.warning("Session DB FTS rebuild failed: %s", exc)
-            return False
+        if db is not None and hasattr(db, "rebuild_fts"):
+            try:
+                rebuilt = db.rebuild_fts()
+            except Exception as exc:
+                logger.warning("Session DB FTS rebuild failed: %s", exc)
+        succeeded = rebuilt > 0
+        with self._transcript_retry_lock:
+            self._fts_rebuild_generation = (
+                int(getattr(self, "_fts_rebuild_generation", 0)) + 1
+            )
+            self._fts_rebuild_last_succeeded = succeeded
+            self._fts_rebuild_in_progress = False
+            self._fts_rebuild_condition_locked().notify_all()
         if rebuilt:
             logger.warning(
                 "Rebuilt %d Session DB FTS index(es) after append corruption",
                 rebuilt,
             )
-        return rebuilt > 0
+        return succeeded
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages for a session.
