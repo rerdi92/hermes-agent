@@ -1722,6 +1722,75 @@ class TestGatewaySessionDbRecovery:
         assert db.persisted == ["first", "second"]
         assert "s1" not in store._dirty_transcripts
 
+    def test_different_sessions_append_concurrently(self):
+        """A blocked session drain must not stall another session."""
+        import threading
+
+        class FakeDb:
+            def __init__(self):
+                self.slow_entered = threading.Event()
+                self.release_slow = threading.Event()
+                self.fast_done = threading.Event()
+
+            def append_message(self, **kwargs):
+                if kwargs["session_id"] == "slow":
+                    self.slow_entered.set()
+                    assert self.release_slow.wait(timeout=2)
+                else:
+                    self.fast_done.set()
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        slow = threading.Thread(
+            target=store.append_to_transcript,
+            args=("slow", {"role": "user", "content": "slow"}),
+        )
+        fast = threading.Thread(
+            target=store.append_to_transcript,
+            args=("fast", {"role": "user", "content": "fast"}),
+        )
+
+        slow.start()
+        assert db.slow_entered.wait(timeout=2)
+        fast.start()
+        fast_completed_while_slow_blocked = db.fast_done.wait(timeout=0.5)
+        db.release_slow.set()
+        slow.join(timeout=2)
+        fast.join(timeout=2)
+
+        assert fast_completed_while_slow_blocked
+        assert not slow.is_alive() and not fast.is_alive()
+
+    def test_fts_rebuild_retry_persists_recovered_head_exactly_once(self):
+        """A successful post-rebuild retry must not loop over the same head."""
+        class FakeDb:
+            def __init__(self):
+                self.attempts = []
+                self.persisted = []
+                self.rebuild_calls = 0
+
+            def rebuild_fts(self):
+                self.rebuild_calls += 1
+                return 1
+
+            def append_message(self, **kwargs):
+                content = kwargs["content"]
+                self.attempts.append(content)
+                if len(self.attempts) == 1:
+                    raise RuntimeError("database disk image is malformed")
+                self.persisted.append(content)
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        store._fts_rebuild_attempted = False
+
+        store.append_to_transcript("s1", {"role": "user", "content": "only"})
+
+        assert db.rebuild_calls == 1
+        assert db.attempts == ["only", "only"]
+        assert db.persisted == ["only"]
+        assert "s1" not in store._dirty_transcripts
+
     def test_rewrite_waits_for_inflight_append_before_replacing(self):
         """A stale append already in flight cannot land after a rewrite."""
         import threading
