@@ -5132,9 +5132,28 @@ def _active_image_routing_identity(agent: Any) -> tuple[str, str]:
     )
 
 
-def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
+def _active_image_routing_runtime(agent: Any) -> dict[str, Any]:
+    """Snapshot the live TUI agent runtime for pre-turn auxiliary calls."""
+    provider, model = _active_image_routing_identity(agent)
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": getattr(agent, "base_url", "") or "",
+        "api_key": getattr(agent, "api_key", "") or "",
+        "api_mode": getattr(agent, "api_mode", "") or "",
+        "auth_mode": getattr(agent, "auth_mode", "") or "",
+    }
+
+
+def _enrich_with_attached_images(
+    user_text: str,
+    image_paths: list[str],
+    *,
+    main_runtime: Optional[dict[str, Any]] = None,
+) -> str:
     """Pre-analyze attached images via vision and prepend descriptions to user text."""
     import asyncio, json as _json
+    from agent.auxiliary_client import scoped_runtime_main
     from tools.vision_tools import vision_analyze_tool
 
     prompt = (
@@ -5144,29 +5163,50 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     )
 
     parts: list[str] = []
-    for path in image_paths:
-        p = Path(path)
-        if not p.exists():
-            continue
-        hint = f"[You can examine it with vision_analyze using image_url: {p}]"
-        try:
-            r = _json.loads(
-                asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
-            )
-            desc = r.get("analysis", "") if r.get("success") else None
-            parts.append(
-                f"[The user attached an image:\n{desc}]\n{hint}"
-                if desc
-                else f"[The user attached an image but analysis failed.]\n{hint}"
-            )
-        except Exception:
-            parts.append(f"[The user attached an image but analysis failed.]\n{hint}")
+    # This helper runs before AIAgent.run_conversation(), often in a new daemon
+    # thread. ContextVars do not appear in a fresh thread automatically, so bind
+    # the live TUI session explicitly instead of falling back to persisted config.
+    with scoped_runtime_main(main_runtime):
+        for path in image_paths:
+            p = Path(path)
+            if not p.exists():
+                continue
+            hint = f"[You can examine it with vision_analyze using image_url: {p}]"
+            try:
+                r = _json.loads(
+                    asyncio.run(
+                        vision_analyze_tool(image_url=str(p), user_prompt=prompt)
+                    )
+                )
+                desc = r.get("analysis", "") if r.get("success") else None
+                parts.append(
+                    f"[The user attached an image:\n{desc}]\n{hint}"
+                    if desc
+                    else f"[The user attached an image but analysis failed.]\n{hint}"
+                )
+            except Exception:
+                parts.append(
+                    f"[The user attached an image but analysis failed.]\n{hint}"
+                )
 
     text = user_text or ""
     prefix = "\n\n".join(parts)
     if prefix:
         return f"{prefix}\n\n{text}" if text else prefix
     return text or "What do you see in this image?"
+
+
+def _enrich_attached_images_for_agent(
+    agent: Any,
+    user_text: str,
+    image_paths: list[str],
+) -> str:
+    """Enrich images using the current live TUI agent's exact runtime."""
+    return _enrich_with_attached_images(
+        user_text,
+        image_paths,
+        main_runtime=_active_image_routing_runtime(agent),
+    )
 
 
 def _content_display_text(content: Any) -> str:
@@ -9542,15 +9582,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if any(p.get("type") == "image_url" for p in _parts):
                             run_message = _parts
                         else:
-                            run_message = _enrich_with_attached_images(prompt, images)
+                            run_message = _enrich_attached_images_for_agent(
+                                agent, prompt, images
+                            )
                     except Exception as _img_exc:
                         print(
                             f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
                             file=sys.stderr,
                         )
-                        run_message = _enrich_with_attached_images(prompt, images)
+                        run_message = _enrich_attached_images_for_agent(
+                            agent, prompt, images
+                        )
                 else:
-                    run_message = _enrich_with_attached_images(prompt, images)
+                    run_message = _enrich_attached_images_for_agent(
+                        agent, prompt, images
+                    )
 
             def _stream(delta):
                 with session["history_lock"]:
