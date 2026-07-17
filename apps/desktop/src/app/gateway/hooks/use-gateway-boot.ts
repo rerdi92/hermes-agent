@@ -189,7 +189,7 @@ export function useGatewayBoot({
         if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
           if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
             escalated = true
-            failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
+            failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'), 'connection-lost')
           }
 
           scheduleReconnect()

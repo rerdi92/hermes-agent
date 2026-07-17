@@ -21,11 +21,12 @@ import type { ClientSessionState } from '../../../types'
 import {
   _submitInFlight,
   type GatewayRequest,
-  inlineErrorMessage,
   isGatewayTimeoutError,
+  isPromptSubmitTimeoutError,
   isProviderSetupError,
   isSessionBusyError,
   isSessionNotFoundError,
+  submitErrorMessage,
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
@@ -518,7 +519,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
-        const message = inlineErrorMessage(err, copy.promptFailed)
+        const message = submitErrorMessage(err, copy)
 
         updateSessionState(
           sessionId,
@@ -549,6 +550,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         }
 
         if (targetIsCurrentView()) {
+          if (isPromptSubmitTimeoutError(err)) {
+            notify({ kind: 'error', title: copy.promptFailed, message })
+
+            return false
+          }
+
           notifyError(err, copy.promptFailed)
         }
 
