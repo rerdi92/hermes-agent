@@ -277,7 +277,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    release_run_claim,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4013,6 +4021,18 @@ def tick(
                 # job as "already running" until the process restarts.
                 with _running_lock:
                     _running_job_ids.discard(job_id)
+                run_claim = job.get("run_claim")
+                if run_claim is not None:
+                    try:
+                        release_run_claim(job_id, expected_claim=run_claim)
+                    except Exception:
+                        # Preserve the original ledger failure and fail closed;
+                        # the claim TTL remains the last-resort recovery path if
+                        # the jobs store is independently unavailable too.
+                        logger.exception(
+                            "Failed to release one-shot run claim for job '%s'",
+                            job.get("name", job_id),
+                        )
                 logger.error(
                     "Job '%s' not dispatched — execution ledger unavailable: %s",
                     job.get("name", job_id),

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -305,6 +306,62 @@ def test_create_execution_failure_releases_guard_and_allows_retry(monkeypatch):
         )
     ]
     assert "ledger-retry" not in scheduler.get_running_job_ids()
+
+
+def test_create_execution_failure_clears_real_oneshot_claim_for_next_tick(
+    monkeypatch, tmp_path
+):
+    """Failing before dispatch must not wedge a one-shot behind its run claim."""
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    run_at = (now - timedelta(seconds=1)).isoformat()
+    profile_home = tmp_path / "profile"
+    create_calls = []
+    submit_calls = []
+
+    def flaky_create(job_id, *, source):
+        create_calls.append((job_id, source))
+        if len(create_calls) == 1:
+            raise sqlite3.DatabaseError("ledger unavailable")
+        return {"id": "exec-real-retry"}
+
+    class RecordingPool:
+        def submit(self, _callable):
+            submit_calls.append(True)
+            raise ValueError("stop after proving real-store retry")
+
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "create_execution", flaky_create)
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: RecordingPool())
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+
+    with jobs.use_cron_store(profile_home):
+        jobs.save_jobs(
+            [
+                {
+                    "id": "real-ledger-retry",
+                    "name": "real ledger retry",
+                    "prompt": "retry me",
+                    "schedule": {"kind": "once", "run_at": run_at},
+                    "next_run_at": run_at,
+                    "enabled": True,
+                    "state": "scheduled",
+                }
+            ]
+        )
+
+        assert scheduler.tick(verbose=False, sync=False) == 0
+        assert submit_calls == []
+        assert jobs.get_job("real-ledger-retry").get("run_claim") is None
+
+        assert scheduler.tick(verbose=False, sync=False) == 0
+        assert submit_calls == [True]
+        assert len(create_calls) == 2
+
+    assert "real-ledger-retry" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

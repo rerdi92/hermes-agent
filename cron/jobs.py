@@ -1699,6 +1699,27 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def release_run_claim(job_id: str, *, expected_claim: dict) -> bool:
+    """Compare-and-clear a one-shot claim that never reached dispatch.
+
+    The full claim is compared, not just its machine owner, so a stale ticker
+    cannot clear a newer claim acquired by the same process after recovery.
+    """
+    if not isinstance(expected_claim, dict):
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get("run_claim") != expected_claim:
+                return False
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
