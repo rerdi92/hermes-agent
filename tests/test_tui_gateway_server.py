@@ -1481,6 +1481,54 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
 
+def test_session_resume_live_reuse_does_not_duplicate_repaired_active_rows(
+    monkeypatch, tmp_path
+):
+    """Alternation repair must not make active rows look like ancestors."""
+    from hermes_state import SessionDB
+
+    root_id = "repair-root"
+    tip_id = "repair-tip"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(root_id, source="tui")
+    db.append_message(root_id, role="user", content="root prompt")
+    db.append_message(root_id, role="assistant", content="root answer")
+    db.end_session(root_id, "compression")
+    db.create_session(tip_id, source="tui", parent_session_id=root_id)
+    db.append_message(tip_id, role="user", content="active one")
+    db.append_message(tip_id, role="user", content="active two")
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+
+    sid = None
+    try:
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": tip_id},
+            }
+        )
+        sid = first["result"]["session_id"]
+        reused = server.handle_request(
+            {
+                "id": "2",
+                "method": "session.resume",
+                "params": {"session_id": tip_id},
+            }
+        )
+        texts = [message.get("text") for message in reused["result"]["messages"]]
+
+        assert texts == ["root prompt", "root answer", "active one\n\nactive two"]
+    finally:
+        if sid is not None:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     """Resuming a rotated-out parent id must load the continuation's messages.
 

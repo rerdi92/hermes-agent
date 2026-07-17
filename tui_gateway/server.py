@@ -5833,6 +5833,31 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
     return info
 
 
+def _load_resume_histories(db, session_id: str) -> tuple[list, list, list]:
+    """Load model/display histories without treating repair shrinkage as ancestry."""
+    active_display_history = db.get_messages_as_conversation(session_id)
+    model_history = copy.deepcopy(active_display_history)
+    if model_history:
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        repaired = repair_message_sequence(None, model_history)
+        if repaired:
+            logger.info(
+                "Repaired %d message-alternation violation(s) while restoring "
+                "session %s; durable display transcript remains unchanged",
+                repaired,
+                session_id,
+            )
+    display_history = db.get_messages_as_conversation(
+        session_id, include_ancestors=True
+    )
+    # Use the unrepaired active length. repair_message_sequence can merge rows;
+    # subtracting its shorter result mistakes active rows for ancestors and then
+    # duplicates them when _live_session_payload joins prefix + working history.
+    prefix_len = max(0, len(display_history) - len(active_display_history))
+    return model_history, display_history, display_history[:prefix_len]
+
+
 def _deferred_session_record(
     session_key: str,
     *,
@@ -6104,8 +6129,7 @@ def _(rid, params: dict) -> dict:
             # LIVE REPLAY (raw_history → sanitize_replay_history → the resumed
             # session's working conversation). display_history stays verbatim —
             # inspection/export must show what is actually stored.
-            raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            raw_history, display_history, prefix = _load_resume_histories(db, target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -6113,7 +6137,6 @@ def _(rid, params: dict) -> dict:
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = display_history[: max(0, len(display_history) - len(raw_history))]
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -6180,9 +6203,8 @@ def _(rid, params: dict) -> dict:
         db.reopen_session(target)
         # repair_alternation on the model-fed copy only (see the interactive
         # resume above): this loads LIVE REPLAY history; display stays verbatim.
-        raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
+        raw_history, display_history, display_history_prefix = _load_resume_histories(
+            db, target
         )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
@@ -6191,9 +6213,6 @@ def _(rid, params: dict) -> dict:
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = display_history[
-            : max(0, len(display_history) - len(raw_history))
-        ]
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
