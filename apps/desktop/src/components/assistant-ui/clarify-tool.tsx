@@ -20,24 +20,78 @@ import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
+import { Check, CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { clearClarifyRequest, sessionClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
+import { $activeSessionId } from '@/store/session'
 
 import { selectMessageRunning } from './tool/fallback-model'
 import { parseMaybeObject } from './tool/fallback-model/format'
 
 interface ClarifyArgs {
-  question?: string
+  allowOther?: boolean
   choices?: string[] | null
+  maxSelections?: number | null
+  minSelections?: number | null
+  multiSelect?: boolean
+  question?: string
 }
 
 interface ClarifyResult {
   question?: string
   answer?: string
   error?: string
+}
+
+const CLARIFY_RESPOND_TIMEOUT_MS = 120_000
+const MAX_RESPONSE_CLAIMS = 512
+
+// A pending clarify request can briefly have more than one mounted tool row
+// (session tiles, transcript reconciliation, or React remounts). Claim it at
+// module scope before crossing the gateway so those rows cannot answer the same
+// request concurrently. Accepted/stale claims stay claimed; retryable transport
+// failures release their claim. The bounded set prevents unbounded renderer
+// lifetime growth while keeping all recent transcript rows protected.
+const claimedClarifyResponses = new Set<string>()
+
+function clarifyResponseKey(requestId: string, sessionId: string | null): string {
+  return `${sessionId ?? ''}\u0000${requestId}`
+}
+
+function claimClarifyResponse(key: string): boolean {
+  if (claimedClarifyResponses.has(key)) {
+    return false
+  }
+
+  claimedClarifyResponses.add(key)
+
+  if (claimedClarifyResponses.size > MAX_RESPONSE_CLAIMS) {
+    const oldest = claimedClarifyResponses.values().next().value
+
+    if (oldest !== undefined) {
+      claimedClarifyResponses.delete(oldest)
+    }
+  }
+
+  return true
+}
+
+function releaseClarifyResponse(key: string): void {
+  claimedClarifyResponses.delete(key)
+}
+
+function readNumber(row: Record<string, unknown>, camel: string, snake: string): number | null | undefined {
+  const value = row[camel] !== undefined ? row[camel] : row[snake]
+
+  return typeof value === 'number' ? value : value === null ? null : undefined
+}
+
+function readBoolean(row: Record<string, unknown>, camel: string, snake: string): boolean | undefined {
+  const value = row[camel] !== undefined ? row[camel] : row[snake]
+
+  return typeof value === 'boolean' ? value : undefined
 }
 
 function stringField(row: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -50,13 +104,32 @@ function stringField(row: Record<string, unknown>, ...keys: string[]): string | 
   }
 }
 
+function isClarifyRespondTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /request timed out:\s*clarify\.respond/i.test(message)
+}
+
+function isClarifyNoPendingRequestError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /no pending answer request/i.test(message)
+}
+
 function readClarifyArgs(args: unknown): ClarifyArgs {
   const row = parseMaybeObject(args)
-  const choices = Array.isArray(row.choices) ? row.choices.filter((c): c is string => typeof c === 'string') : null
+
+  const choices = Array.isArray(row.choices)
+    ? row.choices.filter((choice): choice is string => typeof choice === 'string')
+    : null
 
   return {
-    question: stringField(row, 'question'),
-    choices: choices && choices.length > 0 ? choices : null
+    allowOther: readBoolean(row, 'allowOther', 'allow_other'),
+    choices: choices && choices.length > 0 ? choices : null,
+    maxSelections: readNumber(row, 'maxSelections', 'max_selections'),
+    minSelections: readNumber(row, 'minSelections', 'min_selections'),
+    multiSelect: readBoolean(row, 'multiSelect', 'multi_select'),
+    question: stringField(row, 'question')
   }
 }
 
@@ -125,6 +198,32 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   )
 }
 
+function SelectToggle({ selected }: { selected: boolean }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        'mt-px grid size-4 shrink-0 place-items-center rounded-full border transition-colors',
+        selected ? 'border-primary bg-primary text-white' : 'border-(--ui-stroke-secondary) text-transparent'
+      )}
+    >
+      {selected && <Check className="size-3" />}
+    </span>
+  )
+}
+
+function toggleChoice(choices: string[], choice: string, maxSelections: number | null): string[] {
+  if (choices.includes(choice)) {
+    return choices.filter(item => item !== choice)
+  }
+
+  if (maxSelections !== null && choices.length >= maxSelections) {
+    return choices
+  }
+
+  return [...choices, choice]
+}
+
 export const ClarifyTool = (props: ToolCallMessagePartProps) => {
   // Answered → settled Q&A (ToolFallback collapsed the answer away).
   if (props.result !== undefined) {
@@ -188,6 +287,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   // The tool row is in whichever session's transcript rendered it — read THAT
   // session's clarify (primary or tile), not the globally-active one.
   const sessionId = useStore(useSessionView().$runtimeId)
+  const activeSessionId = useStore($activeSessionId)
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const gateway = useStore($gateway)
@@ -213,11 +313,19 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   )
 
   const hasChoices = choices.length > 0
+  const multiSelect = fromArgs.multiSelect ?? matchingRequest?.multiSelect ?? false
+  const allowOther = fromArgs.allowOther ?? matchingRequest?.allowOther ?? true
+  const minSelections = Math.max(0, Math.trunc(fromArgs.minSelections ?? matchingRequest?.minSelections ?? 0))
+  const configuredMaxSelections = fromArgs.maxSelections ?? matchingRequest?.maxSelections ?? null
+  const maxSelections = configuredMaxSelections === null ? null : Math.max(0, Math.trunc(configuredMaxSelections))
 
   const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [selectedChoice, setSelectedChoice] = useState<string | null>(null)
+  const [selectedChoices, setSelectedChoices] = useState<string[]>([])
   const [otherFocused, setOtherFocused] = useState(false)
+  const [expired, setExpired] = useState(false)
+  const submittingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   // Race: tool.start fires a tick before clarify.request, so request_id
@@ -241,47 +349,114 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
         return
       }
 
+      const responseKey = clarifyResponseKey(matchingRequest.requestId, matchingRequest.sessionId)
+
+      if (submittingRef.current || !claimClarifyResponse(responseKey)) {
+        return
+      }
+
+      submittingRef.current = true
       setSubmitting(true)
 
       try {
-        await gateway.request<{ ok?: boolean }>('clarify.respond', {
-          request_id: matchingRequest.requestId,
-          answer
-        })
+        await gateway.request<{ ok?: boolean }>(
+          'clarify.respond',
+          {
+            request_id: matchingRequest.requestId,
+            answer
+          },
+          CLARIFY_RESPOND_TIMEOUT_MS
+        )
         triggerHaptic('submit')
         clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
-        notifyError(error, copy.sendFailed)
-        setSubmitting(false)
+        if (isClarifyRespondTimeoutError(error)) {
+          notify({
+            kind: 'warning',
+            title: copy.responsePendingTitle,
+            message: copy.responsePendingMessage,
+            detail: error instanceof Error ? error.message : String(error),
+            durationMs: 12_000
+          })
+          releaseClarifyResponse(responseKey)
+          submittingRef.current = false
+          setSubmitting(false)
+        } else if (isClarifyNoPendingRequestError(error)) {
+          clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
+          setExpired(true)
+          notify({
+            kind: 'warning',
+            title: copy.responseExpiredTitle,
+            message: copy.responseExpiredMessage,
+            detail: error instanceof Error ? error.message : String(error),
+            durationMs: 12_000
+          })
+        } else {
+          notifyError(error, copy.sendFailed)
+          releaseClarifyResponse(responseKey)
+          submittingRef.current = false
+          setSubmitting(false)
+        }
       }
     },
-    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, ready]
+    [
+      copy.gatewayDisconnected,
+      copy.notReady,
+      copy.responseExpiredMessage,
+      copy.responseExpiredTitle,
+      copy.responsePendingMessage,
+      copy.responsePendingTitle,
+      copy.sendFailed,
+      gateway,
+      matchingRequest,
+      ready
+    ]
   )
 
   const trimmedDraft = draft.trim()
-  // The answer is whichever input is active: a picked choice, or typed text.
-  // Picking a choice no longer fires immediately — it selects, then the user
-  // confirms with Continue (or Enter from the field).
-  const pendingAnswer = selectedChoice ?? (trimmedDraft || null)
+  const selectedSummary = selectedChoices.join(', ')
+  const customSummary = trimmedDraft ? `${copy.other}: ${trimmedDraft}` : ''
+  const selectionSummary = selectedSummary || selectedChoice || customSummary
+  const selectedChoiceCount = selectedChoices.length
+  const canSubmitSelected = multiSelect && selectedChoiceCount > 0 && selectedChoiceCount >= minSelections
+  const canSkip = minSelections <= 0 && (multiSelect || !hasChoices || allowOther)
+  const selectionLimitReached = maxSelections !== null && selectedChoiceCount >= maxSelections
 
-  const selectChoice = useCallback((choice: string) => {
-    // Picking a choice and typing are mutually exclusive answers.
-    setDraft('')
-    setSelectedChoice(choice)
-  }, [])
+  const selectChoice = useCallback(
+    (choice: string) => {
+      setDraft('')
+      setSelectedChoices([])
+      setSelectedChoice(choice)
+      void respond(choice)
+    },
+    [respond]
+  )
 
-  const submitAnswer = useCallback(() => {
-    if (selectedChoice !== null) {
-      void respond(selectedChoice)
+  const toggleMultiChoice = useCallback(
+    (choice: string) => {
+      if (!multiSelect) {
+        return
+      }
 
-      return
+      setDraft('')
+      setSelectedChoice(null)
+      setSelectedChoices(current => toggleChoice(current, choice, maxSelections))
+    },
+    [maxSelections, multiSelect]
+  )
+
+  const submitSelected = useCallback(() => {
+    if (canSubmitSelected) {
+      void respond(selectedChoices.join(', '))
     }
+  }, [canSubmitSelected, respond, selectedChoices])
 
+  const submitDraft = useCallback(() => {
     if (trimmedDraft) {
       void respond(trimmedDraft)
     }
-  }, [respond, selectedChoice, trimmedDraft])
+  }, [respond, trimmedDraft])
 
   const handleTextareaKey = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -291,49 +466,56 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault()
-        submitAnswer()
+        submitDraft()
       }
     },
-    [submitAnswer]
+    [submitDraft]
   )
 
-  const handleSubmit = useCallback(
+  const handleSubmitDraft = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault()
-      submitAnswer()
+      submitDraft()
     },
-    [submitAnswer]
+    [submitDraft]
   )
 
-  // Letter shortcuts: A/B/C… pick the matching option, the trailing letter jumps
-  // into "Other", and Enter confirms the current pick. Stands down whenever a
-  // field is focused (you're typing, not navigating) so it never eats keystrokes
-  // meant for the composer or the Other box.
+  // Letter shortcuts are owned by the active session only. Multiple session
+  // tiles may have live clarify panels at once; without this gate the same key
+  // would answer whichever effect happened to mount first (or more than one).
   useEffect(() => {
-    if (!ready || !hasChoices || submitting) {
+    if (!ready || !hasChoices || submitting || expired || sessionId !== activeSessionId) {
       return
     }
 
-    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+    const handleShortcut = (event: globalThis.KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) {
         return
       }
 
       const active = document.activeElement as HTMLElement | null
+      const tag = active?.tagName.toLowerCase()
 
-      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+      if (tag === 'input' || tag === 'textarea' || active?.isContentEditable) {
         return
       }
 
-      const key = event.key.toLowerCase()
+      if (event.key.length === 1) {
+        const index = event.key.toUpperCase().charCodeAt(0) - 65
 
-      if (key.length === 1 && key >= 'a' && key <= 'z') {
-        const index = key.charCodeAt(0) - 97
-
-        if (index < choices.length) {
+        if (index >= 0 && index < choices.length) {
           event.preventDefault()
-          selectChoice(choices[index])
-        } else if (index === choices.length) {
+
+          if (multiSelect) {
+            toggleMultiChoice(choices[index])
+          } else {
+            selectChoice(choices[index])
+          }
+
+          return
+        }
+
+        if (allowOther && index === choices.length) {
           event.preventDefault()
           textareaRef.current?.focus()
         }
@@ -341,16 +523,40 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
         return
       }
 
-      if (event.key === 'Enter' && pendingAnswer) {
+      if (event.key === 'Enter' && multiSelect && canSubmitSelected && !trimmedDraft) {
         event.preventDefault()
-        submitAnswer()
+        submitSelected()
       }
     }
 
-    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keydown', handleShortcut)
 
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [choices, hasChoices, pendingAnswer, ready, selectChoice, submitAnswer, submitting])
+    return () => window.removeEventListener('keydown', handleShortcut)
+  }, [
+    activeSessionId,
+    allowOther,
+    canSubmitSelected,
+    choices,
+    expired,
+    hasChoices,
+    multiSelect,
+    ready,
+    selectChoice,
+    sessionId,
+    submitSelected,
+    submitting,
+    toggleMultiChoice,
+    trimmedDraft
+  ])
+
+  if (expired) {
+    return (
+      <ClarifyShell className="grid gap-1 px-2.5 py-2" role="status">
+        <div className="font-medium text-(--ui-text-primary)">{copy.responseExpiredTitle}</div>
+        <div className="text-xs text-(--ui-text-secondary)">{copy.responseExpiredMessage}</div>
+      </ClarifyShell>
+    )
+  }
 
   if (loading) {
     return (
@@ -367,10 +573,11 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const onDraftChange = (value: string) => {
     setDraft(value)
 
-    // Typing is its own answer — drop any picked choice so the two inputs can't
-    // both look selected.
+    // Typing is its own answer — drop any picked/staged choice so the inputs
+    // can't both look selected.
     if (value.trim()) {
       setSelectedChoice(null)
+      setSelectedChoices([])
     }
   }
 
@@ -381,11 +588,58 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
         <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
       </div>
 
-      <form className="grid gap-2" onSubmit={handleSubmit}>
-        {hasChoices ? (
-          <div className="grid gap-px" role="group">
-            {choices.map((choice, index) => (
+      {selectionSummary && (
+        <div className="rounded-[0.25rem] border border-primary/20 bg-primary/5 px-2 py-1 text-xs" role="status">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-primary">{copy.selected}</span>
+            {selectedChoiceCount > 0 && (
+              <span className="text-(--ui-text-tertiary)">{copy.selectedCount(selectedChoiceCount)}</span>
+            )}
+          </div>
+          <div className="mt-0.5 wrap-anywhere text-(--ui-text-secondary)">{selectionSummary}</div>
+        </div>
+      )}
+
+      {hasChoices && multiSelect && (
+        <div
+          className="rounded-[0.25rem] bg-(--chrome-action-hover) px-2 py-1 text-xs text-(--ui-text-secondary)"
+          role="note"
+        >
+          {copy.multiSelectHint}
+        </div>
+      )}
+
+      {hasChoices && (
+        <div className="grid gap-px" role="group">
+          {choices.map((choice, index) => {
+            const staged = selectedChoices.includes(choice)
+
+            if (multiSelect) {
+              return (
+                <button
+                  aria-label={`Toggle ${choice} for multi-select`}
+                  aria-pressed={staged}
+                  className={cn(
+                    OPTION_ROW_CLASS,
+                    'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+                    staged && 'text-(--ui-text-primary)'
+                  )}
+                  data-choice
+                  disabled={submitting || (selectionLimitReached && !staged)}
+                  key={`${index}-${choice}`}
+                  onClick={() => toggleMultiChoice(choice)}
+                  type="button"
+                >
+                  <KeyBadge char={letterFor(index)} selected={staged} />
+                  <span className="flex-1 wrap-anywhere">{choice}</span>
+                  <SelectToggle selected={staged} />
+                </button>
+              )
+            }
+
+            return (
               <button
+                aria-label={choice}
                 className={cn(
                   OPTION_ROW_CLASS,
                   'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
@@ -400,16 +654,20 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 <KeyBadge char={letterFor(index)} selected={selectedChoice === choice} />
                 <span className="flex-1 wrap-anywhere">{choice}</span>
               </button>
-            ))}
-            <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
+            )
+          })}
+          {allowOther && (
+            <label className={cn(OPTION_ROW_CLASS, 'items-center focus-within:bg-(--chrome-action-hover)')}>
               <KeyBadge char={letterFor(choices.length)} preview={otherFocused} selected={Boolean(trimmedDraft)} />
               <Textarea
+                aria-label={copy.other}
                 className={CLARIFY_TEXTAREA_CLASS}
                 disabled={submitting}
                 onBlur={() => setOtherFocused(false)}
                 onChange={event => onDraftChange(event.target.value)}
                 onFocus={() => {
                   setSelectedChoice(null)
+                  setSelectedChoices([])
                   setOtherFocused(true)
                 }}
                 onKeyDown={handleTextareaKey}
@@ -420,8 +678,12 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 value={draft}
               />
             </label>
-          </div>
-        ) : (
+          )}
+        </div>
+      )}
+
+      {!hasChoices && (
+        <form className="grid gap-2" onSubmit={handleSubmitDraft}>
           <Textarea
             className={CLARIFY_TEXTAREA_CLASS}
             disabled={submitting}
@@ -433,13 +695,21 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
             size="sm"
             value={draft}
           />
-        )}
+        </form>
+      )}
 
-        <div className="flex items-center justify-end gap-1">
+      <div className="flex items-center justify-end gap-1">
+        {canSkip && (
           <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
             {copy.skip}
           </Button>
-          <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
+        )}
+        {multiSelect && !trimmedDraft ? (
+          <Button disabled={submitting || !canSubmitSelected} onClick={submitSelected} size="xs" type="button">
+            {submitting ? <Loader2 className="size-3 animate-spin" /> : copy.selectSelected}
+          </Button>
+        ) : (
+          <Button disabled={submitting || !trimmedDraft} onClick={submitDraft} size="xs" type="button">
             {submitting ? (
               <Loader2 className="size-3 animate-spin" />
             ) : (
@@ -451,8 +721,8 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
               </>
             )}
           </Button>
-        </div>
-      </form>
+        )}
+      </div>
     </ClarifyShell>
   )
 }

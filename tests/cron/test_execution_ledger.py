@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -37,6 +38,30 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
+
+
+def test_post_import_home_repoint_keeps_execution_ledger_profile_local(
+    monkeypatch, tmp_path
+):
+    """Late HERMES_HOME changes must never write the import-time profile DB."""
+    import cron.executions as executions
+
+    old_file = tmp_path / "old-profile" / "cron" / "executions.db"
+    old_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"old-profile-sentinel")
+    monkeypatch.setattr(executions, "_IMPORT_EXECUTIONS_FILE", old_file, raising=False)
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", old_file)
+
+    new_home = tmp_path / "new-profile"
+    monkeypatch.setenv("HERMES_HOME", str(new_home))
+
+    record = executions.create_execution("profile-job", source="builtin")
+    executions.mark_execution_running(record["id"])
+    executions.finish_execution(record["id"], success=True)
+
+    assert executions.latest_execution("profile-job")["status"] == "completed"
+    assert (new_home / "cron" / "executions.db").exists()
+    assert old_file.read_bytes() == b"old-profile-sentinel"
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
@@ -235,6 +260,108 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_create_execution_failure_releases_guard_and_allows_retry(monkeypatch):
+    import cron.scheduler as scheduler
+
+    create_calls = []
+    submit_calls = []
+    finished = []
+
+    def flaky_create(job_id, *, source):
+        create_calls.append((job_id, source))
+        if len(create_calls) == 1:
+            raise sqlite3.DatabaseError("ledger unavailable")
+        return {"id": "exec-retry"}
+
+    class RecordingPool:
+        def submit(self, _callable):
+            submit_calls.append(True)
+            raise ValueError("stop after proving retry dispatch")
+
+    monkeypatch.setattr(scheduler, "create_execution", flaky_create)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "ledger-retry"}])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: RecordingPool())
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert submit_calls == []
+    assert "ledger-retry" not in scheduler.get_running_job_ids()
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert submit_calls == [True]
+    assert finished == [
+        (
+            "exec-retry",
+            {
+                "success": False,
+                "error": "Executor dispatch failed: stop after proving retry dispatch",
+            },
+        )
+    ]
+    assert "ledger-retry" not in scheduler.get_running_job_ids()
+
+
+def test_create_execution_failure_clears_real_oneshot_claim_for_next_tick(
+    monkeypatch, tmp_path
+):
+    """Failing before dispatch must not wedge a one-shot behind its run claim."""
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    run_at = (now - timedelta(seconds=1)).isoformat()
+    profile_home = tmp_path / "profile"
+    create_calls = []
+    submit_calls = []
+
+    def flaky_create(job_id, *, source):
+        create_calls.append((job_id, source))
+        if len(create_calls) == 1:
+            raise sqlite3.DatabaseError("ledger unavailable")
+        return {"id": "exec-real-retry"}
+
+    class RecordingPool:
+        def submit(self, _callable):
+            submit_calls.append(True)
+            raise ValueError("stop after proving real-store retry")
+
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "create_execution", flaky_create)
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: RecordingPool())
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+
+    with jobs.use_cron_store(profile_home):
+        jobs.save_jobs(
+            [
+                {
+                    "id": "real-ledger-retry",
+                    "name": "real ledger retry",
+                    "prompt": "retry me",
+                    "schedule": {"kind": "once", "run_at": run_at},
+                    "next_run_at": run_at,
+                    "enabled": True,
+                    "state": "scheduled",
+                }
+            ]
+        )
+
+        assert scheduler.tick(verbose=False, sync=False) == 0
+        assert submit_calls == []
+        assert jobs.get_job("real-ledger-retry").get("run_claim") is None
+
+        assert scheduler.tick(verbose=False, sync=False) == 0
+        assert submit_calls == [True]
+        assert len(create_calls) == 2
+
+    assert "real-ledger-retry" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

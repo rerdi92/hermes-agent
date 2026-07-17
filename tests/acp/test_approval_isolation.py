@@ -211,7 +211,10 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
-        from tools.approval import check_all_command_guards
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        check_all_command_guards = approval_module.check_all_command_guards
 
         called_with = []
 
@@ -262,6 +265,9 @@ class TestAcpExecAskGate:
             reset_hermes_interactive_context,
             set_hermes_interactive_context,
         )
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         called_with = []
 
@@ -284,3 +290,197 @@ class TestAcpExecAskGate:
             "commands through the callback without HERMES_INTERACTIVE in env"
         )
         assert result["approved"] is True
+
+    def test_acp_authority_makes_smart_approve_advisory(self, monkeypatch):
+        """ACP's editor callback remains authoritative over Smart APPROVE."""
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args: "approve")
+        callback_calls = []
+
+        def deny_cb(command, description, *, allow_permanent=True):
+            callback_calls.append((command, description, allow_permanent))
+            return "deny"
+
+        interactive_token = approval_module.set_hermes_interactive_context(True)
+        authority_token = approval_module.set_acp_approval_authority_context(True)
+        try:
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/test-acp-authority",
+                "local",
+                approval_callback=deny_cb,
+            )
+        finally:
+            approval_module.reset_acp_approval_authority_context(authority_token)
+            approval_module.reset_hermes_interactive_context(interactive_token)
+
+        assert len(callback_calls) == 1
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
+        assert "smart_approved" not in result
+
+        # Outside ACP authority, ordinary interactive Smart mode keeps its
+        # documented auto-approval behavior and does not invoke the callback.
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        callback_calls.clear()
+        ordinary_result = approval_module.check_all_command_guards(
+            "rm -rf /tmp/test-ordinary-smart",
+            "local",
+            approval_callback=deny_cb,
+        )
+        assert callback_calls == []
+        assert ordinary_result["approved"] is True
+        assert ordinary_result["smart_approved"] is True
+
+    def test_acp_authority_context_isolated_in_shared_executor(self, monkeypatch):
+        """Concurrent ACP authority cannot leak into an ordinary Smart turn."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from tools import approval as approval_module
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args: "approve")
+        barrier = threading.Barrier(2)
+        callback_calls = []
+
+        def authoritative_turn():
+            interactive = approval_module.set_hermes_interactive_context(True)
+            authority = approval_module.set_acp_approval_authority_context(True)
+            try:
+                barrier.wait(timeout=5)
+                return approval_module.check_all_command_guards(
+                    "rm -rf /tmp/test-acp-concurrent",
+                    "local",
+                    approval_callback=lambda *_a, **_k: callback_calls.append("acp") or "deny",
+                )
+            finally:
+                approval_module.reset_acp_approval_authority_context(authority)
+                approval_module.reset_hermes_interactive_context(interactive)
+
+        def ordinary_turn():
+            interactive = approval_module.set_hermes_interactive_context(True)
+            try:
+                barrier.wait(timeout=5)
+                return approval_module.check_all_command_guards(
+                    "rm -rf /tmp/test-ordinary-concurrent",
+                    "local",
+                    approval_callback=lambda *_a, **_k: callback_calls.append("ordinary") or "deny",
+                )
+            finally:
+                approval_module.reset_hermes_interactive_context(interactive)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            authoritative_future = executor.submit(authoritative_turn)
+            ordinary_future = executor.submit(ordinary_turn)
+            authoritative = authoritative_future.result(timeout=10)
+            ordinary = ordinary_future.result(timeout=10)
+            residual = [
+                executor.submit(
+                    approval_module._acp_approval_authority_ctx.get
+                ).result(timeout=5)
+                for _ in range(2)
+            ]
+
+        assert authoritative["approved"] is False
+        assert ordinary["approved"] is True
+        assert ordinary["smart_approved"] is True
+        assert callback_calls == ["acp"]
+        assert residual == [False, False]
+
+    def test_acp_authority_without_callback_denies_before_smart(self, monkeypatch):
+        """Missing ACP callback is a denial, not auxiliary consent."""
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from tools import approval as approval_module
+
+        smart_calls = []
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args: smart_calls.append(True) or "approve",
+        )
+        interactive_token = approval_module.set_hermes_interactive_context(True)
+        authority_token = approval_module.set_acp_approval_authority_context(True)
+        try:
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/test-acp-no-callback",
+                "local",
+                approval_callback=None,
+            )
+        finally:
+            approval_module.reset_acp_approval_authority_context(authority_token)
+            approval_module.reset_hermes_interactive_context(interactive_token)
+
+        assert smart_calls == []
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
+
+    def test_acp_authority_uses_owner_callback_despite_gateway_flags(self, monkeypatch):
+        """Leaked gateway env flags cannot divert ACP into the queue path."""
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args: "approve")
+        callback_calls = []
+        interactive = approval_module.set_hermes_interactive_context(True)
+        authority = approval_module.set_acp_approval_authority_context(True)
+        try:
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/test-acp-gateway-env",
+                "local",
+                approval_callback=lambda *_a, **_k: callback_calls.append(True) or "deny",
+            )
+        finally:
+            approval_module.reset_acp_approval_authority_context(authority)
+            approval_module.reset_hermes_interactive_context(interactive)
+
+        assert callback_calls == [True]
+        assert result["approved"] is False
+        assert result["user_consent"] is False
+
+    def test_acp_authority_malformed_callback_choice_denies(self, monkeypatch):
+        """Unhashable, missing, and unexpected callback output all deny."""
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args: "escalate")
+        for malformed in (None, "unexpected", {"choice": "deny"}, []):
+            interactive_token = approval_module.set_hermes_interactive_context(True)
+            authority_token = approval_module.set_acp_approval_authority_context(True)
+            try:
+                result = approval_module.check_all_command_guards(
+                    "rm -rf /tmp/test-acp-malformed",
+                    "local",
+                    approval_callback=lambda *_args, _value=malformed, **_kwargs: _value,
+                )
+            finally:
+                approval_module.reset_acp_approval_authority_context(authority_token)
+                approval_module.reset_hermes_interactive_context(interactive_token)
+
+            assert result["approved"] is False, repr(malformed)
+            assert result["outcome"] == "denied", repr(malformed)
+            assert result["user_consent"] is False, repr(malformed)

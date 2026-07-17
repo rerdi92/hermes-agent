@@ -87,6 +87,9 @@ export const ja = defineLocale({
       remoteTitle: 'リモートゲートウェイへのサインインが必要です',
       remoteDescription:
         'リモートゲートウェイのセッションが期限切れです。再接続するにはもう一度サインインしてください。チャットや設定は削除されません。',
+      connectionLostTitle: 'Hermes の接続が中断されました',
+      connectionLostDescription:
+        'Hermes は起動しましたが、デスクトップとゲートウェイのライブ接続が切れました。再試行すると再インストールせずに接続し直します。チャットや設定は保持されます。',
       retry: '再試行',
       repairInstall: 'インストールを修復',
       useLocalGateway: 'ローカルゲートウェイを使用',
@@ -94,6 +97,8 @@ export const ja = defineLocale({
       back: '戻る',
       openLogs: 'ログを開く',
       repairHint: '修復はインストーラーを再実行します。新しいマシンでは数分かかる場合があります。',
+      connectionLostHint:
+        '再試行は実行中のゲートウェイへ再接続します。これはインストール失敗ではなく接続中断なので、修復インストールは表示しません。',
       remoteSignInHint: signInLabel =>
         `保存済みのリモートブラウザセッションからサインアウトし、${signInLabel}を開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。`,
       signOutAndSignIn: 'サインアウトして再サインイン',
@@ -1066,6 +1071,7 @@ export const ja = defineLocale({
     gatewayRunning: 'メッセージングゲートウェイが実行中',
     gatewayStopped: 'メッセージングゲートウェイが停止中',
     hermesActiveSessions: (version, count) => `Hermes ${version} · アクティブセッション ${count}`,
+    restartHermes: 'Hermes を再起動',
     restartGateway: 'ゲートウェイを再起動',
     gatewayRestartFailed: 'ゲートウェイの再起動に失敗しました。',
     updateHermes: 'Hermes を更新',
@@ -2086,6 +2092,12 @@ export const ja = defineLocale({
       openContextUsage: 'コンテキスト使用状況の内訳を開く',
       session: 'セッション',
       runtimeSessionElapsed: 'ランタイムセッション経過時間',
+      agentFleetOn: 'Agent Fleet オン — 送信時に agent fleet モードを付与します。クリックでオフにします。',
+      agentFleetOff: 'Agent Fleet オフ — クリックすると送信を agent fleet モードにします。',
+      ultraworkOn: 'ULW オン — 送信時に ultrawork モードを付与します。クリックでオフにします。',
+      ultraworkOff: 'ULW オフ — クリックすると送信時に ultrawork モードを付与します。',
+      ultraresearchOn: 'ULR オン — 送信時に ultraresearch モードを付与します。クリックでオフにします。',
+      ultraresearchOff: 'ULR オフ — クリックすると送信時に ultraresearch モードを付与します。',
       yoloOn: 'YOLO オン — 危険なコマンドを自動承認中。クリックでオフに。Shift+クリックで全体に切り替え。',
       yoloOff: 'YOLO オフ — クリックで危険なコマンドを自動承認。Shift+クリックで全体に切り替え。',
       modelNone: 'なし',
@@ -2324,11 +2336,21 @@ export const ja = defineLocale({
       notReady: '明確化リクエストはまだ準備できていません',
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
+      responsePendingTitle: '明確化応答はまだ処理中の可能性があります',
+      responsePendingMessage:
+        'Hermes は選択を時間内に確認できませんでした。バックエンドにはまだ届く可能性があるため、重複応答を避けるため少し待ってから再試行してください。',
+      responseExpiredTitle: '明確化リクエストの有効期限が切れました',
+      responseExpiredMessage:
+        'この選択リクエストはもう回答待ちではありません。Hermes が再度質問するのを待ってから、新しいプロンプトに回答してください。',
       loadingQuestion: '質問を読み込み中…',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',
       skipped: 'スキップ済み',
+      selected: '選択済み',
+      selectedCount: count => `${count} 件選択`,
+      multiSelectHint: '複数選択：右側の丸で選択肢を一時選択し、「選択項目を送信」を押してください。',
+      selectSelected: '選択項目を送信',
       continueLabel: '続行'
     },
     tool: {
@@ -2452,6 +2474,8 @@ export const ja = defineLocale({
     sessionUnavailable: 'セッションが利用できません',
     createSessionFailed: '新しいセッションを作成できませんでした',
     promptFailed: 'プロンプトに失敗しました',
+    promptSubmitTimedOut:
+      'Hermes はこのメッセージを時間内に確認できませんでした。バックエンドでまだ処理される可能性があるため、二重送信を避けるため少し待ってから再試行してください。',
     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
     emptySlashCommand: '空のスラッシュコマンド',
     desktopCommands: 'デスクトップコマンド',

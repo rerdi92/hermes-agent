@@ -277,7 +277,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    release_run_claim,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -328,6 +336,12 @@ def _is_cron_silence_response(text: str) -> bool:
     if upper.startswith("[SILENT]"):
         return True
     return False
+
+
+# Backward-compatible name used by older cron tests and integrations.  Keep the
+# implementation centralized in the newer, more explicit helper above.
+def _is_silent_response(text: str) -> bool:
+    return _is_cron_silence_response(text)
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2542,6 +2556,44 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
+def _evaluate_cron_pre_dispatch_gate(job: dict) -> dict[str, Any] | None:
+    """Run deterministic and plugin cron gates before a cron job dispatches.
+
+    Returns a gateway-style action dict, or None if all gates allow / fail open.
+    The built-in eval gate is disabled by default and only blocks when explicitly
+    configured for enforcement; failures here must not crash the scheduler.
+    """
+    try:
+        from agent.eval_gate import dispatch_hook_result, evaluate_cron_job
+
+        decision = evaluate_cron_job(job, load_config() or {})
+        result = dispatch_hook_result(decision)
+        if result.get("action") == "skip":
+            logger.warning(
+                "eval_gate pre_cron_dispatch skip: job=%s reason=%s",
+                job.get("id", "?"),
+                result.get("reason"),
+            )
+            return result
+    except Exception as exc:
+        logger.warning("eval_gate pre_cron_dispatch invocation failed for job %s: %s", job.get("id", "?"), exc)
+
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        for result in invoke_hook("pre_cron_dispatch", job=job, scheduler_module=sys.modules[__name__]):
+            if isinstance(result, dict) and result.get("action") == "skip":
+                logger.warning(
+                    "pre_cron_dispatch plugin skip: job=%s reason=%s",
+                    job.get("id", "?"),
+                    result.get("reason"),
+                )
+                return result
+    except Exception as exc:
+        logger.warning("pre_cron_dispatch plugin invocation failed for job %s: %s", job.get("id", "?"), exc)
+    return None
+
+
 def _guard_job_credential_exfil(job: dict) -> None:
     """Fail closed if a job's stored provider/base_url pair would exfiltrate a
     credential (F8 runtime backstop; CWE-200/CWE-522).
@@ -2609,6 +2661,20 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    _eval_gate_result = _evaluate_cron_pre_dispatch_gate(job)
+    if isinstance(_eval_gate_result, dict) and _eval_gate_result.get("action") == "skip":
+        reason = str(_eval_gate_result.get("reason") or "blocked by eval gate")
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Status:** BLOCKED\n\n"
+            "The eval gate blocked this cron job before dispatch.\n\n"
+            f"**Gate result:** {reason}\n"
+        )
+        return False, blocked_doc, "", reason
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3282,7 +3348,7 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -3479,7 +3545,7 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -3494,14 +3560,14 @@ def run_job(
 
 {logged_response}
 """
-        
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -3560,12 +3626,25 @@ def run_job(
                 )
                 # Last-resort: never leave the session blank (#50535). Try the
                 # next free title in the lineage, then a bare id-stamped title.
-                for _fallback in (
-                    getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(
-                        f"cron {job_id}"
-                    ),
-                    f"cron {job_id} {_cron_session_id[-6:]}",
-                ):
+                _fallback_titles = []
+                try:
+                    _lineage_fallback = getattr(
+                        _session_db, "get_next_title_in_lineage", lambda b: b
+                    )(f"cron {job_id}")
+                    if _lineage_fallback:
+                        _fallback_titles.append(_lineage_fallback)
+                except (Exception, KeyboardInterrupt) as fallback_error:
+                    # The title write and lineage lookup commonly share the
+                    # same failing SQLite connection.  Never let recovery
+                    # bookkeeping escape this finally block and skip DB/agent
+                    # teardown below.
+                    logger.debug(
+                        "Job '%s': failed to derive fallback title: %s",
+                        job_id,
+                        fallback_error,
+                    )
+                _fallback_titles.append(f"cron {job_id} {_cron_session_id[-6:]}")
+                for _fallback in _fallback_titles:
                     try:
                         if _set_cron_session_title(
                             _session_db, _cron_session_id, _fallback
@@ -3808,10 +3887,10 @@ def tick(
 ):
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
@@ -3933,7 +4012,33 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception as execution_err:
+                # A corrupt/unavailable ledger intentionally fails closed. The
+                # in-flight claim was acquired immediately above, so release it
+                # before returning; otherwise every later healthy tick skips the
+                # job as "already running" until the process restarts.
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                run_claim = job.get("run_claim")
+                if run_claim is not None:
+                    try:
+                        release_run_claim(job_id, expected_claim=run_claim)
+                    except Exception:
+                        # Preserve the original ledger failure and fail closed;
+                        # the claim TTL remains the last-resort recovery path if
+                        # the jobs store is independently unavailable too.
+                        logger.exception(
+                            "Failed to release one-shot run claim for job '%s'",
+                            job.get("name", job_id),
+                        )
+                logger.error(
+                    "Job '%s' not dispatched — execution ledger unavailable: %s",
+                    job.get("name", job_id),
+                    execution_err,
+                )
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

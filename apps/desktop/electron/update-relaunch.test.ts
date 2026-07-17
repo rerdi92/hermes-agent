@@ -38,7 +38,7 @@ import {
 } from './update-relaunch'
 
 const ROOT = '/home/u/.hermes/hermes-agent'
-const UNPACKED = path.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked')
+const UNPACKED = path.posix.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked')
 
 // ---------------------------------------------------------------------------
 // 1) The execPath split — the heart of the GUI/backend skew guard.
@@ -50,7 +50,7 @@ test('unpackedDirName maps platform to the electron-builder dir', () => {
 })
 
 test('resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-unpacked', () => {
-  const exec = path.join(UNPACKED, 'hermes')
+  const exec = path.posix.join(UNPACKED, 'hermes')
   assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
   // The unpacked dir itself also counts.
   assert.equal(resolveUnpackedRelease(UNPACKED, ROOT, 'linux'), UNPACKED)
@@ -69,13 +69,29 @@ test('resolveUnpackedRelease is null for AppImage / .deb / .rpm / dev / unresolv
   )
   // empty / missing
   assert.equal(resolveUnpackedRelease('', ROOT, 'linux'), null)
-  assert.equal(resolveUnpackedRelease(path.join(UNPACKED, 'hermes'), '', 'linux'), null)
+  assert.equal(resolveUnpackedRelease(path.posix.join(UNPACKED, 'hermes'), '', 'linux'), null)
 })
 
 test('resolveUnpackedRelease is not fooled by a sibling prefix dir', () => {
   // `.../release/linux-unpacked-evil` must NOT match `.../release/linux-unpacked`.
-  const sneaky = path.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked-evil', 'hermes')
+  const sneaky = path.posix.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked-evil', 'hermes')
   assert.equal(resolveUnpackedRelease(sneaky, ROOT, 'linux'), null)
+})
+
+test('resolveUnpackedRelease applies Windows path rules independent of the host OS', () => {
+  const root = 'C:\\Users\\HQ\\.hermes\\hermes-agent'
+  const unpacked = path.win32.join(root, 'apps', 'desktop', 'release', 'win-unpacked')
+
+  // Exact directory and descendants are accepted, including drive/path case differences.
+  assert.equal(resolveUnpackedRelease(unpacked, root, 'win32'), unpacked)
+  assert.equal(
+    resolveUnpackedRelease(path.win32.join(unpacked, 'Hermes.exe').toUpperCase(), root.toLowerCase(), 'win32'),
+    unpacked.toLowerCase()
+  )
+
+  // A sibling that merely shares the prefix must stay outside the trusted release root.
+  const sibling = path.win32.join(root, 'apps', 'desktop', 'release', 'win-unpacked-evil', 'Hermes.exe')
+  assert.equal(resolveUnpackedRelease(sibling, root, 'win32'), null)
 })
 
 test('decideRelaunchOutcome: only under-unpacked + sandbox-ok relaunches', () => {

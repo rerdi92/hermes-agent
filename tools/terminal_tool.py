@@ -200,6 +200,16 @@ def set_approval_callback(cb):
     _callback_tls.approval = cb
 
 
+def clear_approval_callback() -> None:
+    """Clear the current thread's dangerous-command approval callback.
+
+    ACP calls this before installing a turn-specific callback so a failed
+    registration can never leave a callback from an earlier executor task
+    authoritative for the new turn.
+    """
+    _callback_tls.approval = None
+
+
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
     try:
