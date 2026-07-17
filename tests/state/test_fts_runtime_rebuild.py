@@ -13,6 +13,7 @@ from canonical rows, no messages touched), and retries the failed write.
 """
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -109,8 +110,6 @@ class TestRuntimeFtsRebuild:
 
     def test_concurrent_repair_waiter_joins_the_single_rebuild(self, db):
         """A direct writer failing during an in-flight repair waits and retries."""
-        import threading
-
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         rebuild_entered = threading.Event()
@@ -151,6 +150,121 @@ class TestRuntimeFtsRebuild:
         assert not winner.is_alive() and not loser.is_alive()
         assert rebuild_calls == [1]
         assert sorted(results) == [True, True]
+
+    def test_concurrent_real_appends_share_one_rebuild_and_persist_once(
+        self, db, tmp_path
+    ):
+        """Two real writes through _execute_write join one corrupted-FTS repair."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed text")
+        _corrupt_fts(tmp_path / "state.db")
+
+        original_rebuild = db.rebuild_fts
+        original_try = db._try_runtime_fts_rebuild
+        rebuild_entered = threading.Event()
+        second_repair_entered = threading.Event()
+        release_rebuild = threading.Event()
+        repair_entries = []
+        rebuild_calls = []
+        results = []
+        errors = []
+        guard = threading.Lock()
+
+        def blocking_rebuild():
+            rebuild_calls.append(1)
+            rebuild_entered.set()
+            assert release_rebuild.wait(timeout=2)
+            return original_rebuild()
+
+        def observed_try(exc, *, observed_generation=None):
+            with guard:
+                repair_entries.append(threading.current_thread().name)
+                if len(repair_entries) == 2:
+                    second_repair_entered.set()
+            return original_try(
+                exc,
+                observed_generation=observed_generation,
+            )
+
+        db.rebuild_fts = blocking_rebuild
+        db._try_runtime_fts_rebuild = observed_try
+
+        def append(content):
+            try:
+                results.append(db.append_message("s1", "user", content))
+            except Exception as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        first = threading.Thread(target=append, args=("alpha needle",), name="alpha")
+        second = threading.Thread(target=append, args=("beta needle",), name="beta")
+        first.start()
+        assert rebuild_entered.wait(timeout=2)
+        second.start()
+        assert second_repair_entered.wait(timeout=2)
+        release_rebuild.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        assert errors == []
+        assert not first.is_alive() and not second.is_alive()
+        assert rebuild_calls == [1]
+        assert len(results) == 2
+        assert sorted(_message_contents(tmp_path / "state.db")) == [
+            "alpha needle",
+            "beta needle",
+            "seed text",
+        ]
+        raw = sqlite3.connect(str(tmp_path / "state.db"))
+        hits = raw.execute(
+            "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'needle'"
+        ).fetchone()[0]
+        raw.close()
+        assert hits == 2
+
+    def test_failed_rebuild_wakes_all_waiters_without_retry_loop(self, db):
+        """A failed winner publishes failure so every waiter exits boundedly."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        rebuild_entered = threading.Event()
+        release_rebuild = threading.Event()
+        results = []
+        errors = []
+        observed_generation = db._fts_runtime_rebuild_generation
+        corruption = sqlite3.DatabaseError("database disk image is malformed")
+
+        def failed_rebuild():
+            rebuild_entered.set()
+            assert release_rebuild.wait(timeout=2)
+            raise sqlite3.DatabaseError("rebuild failed")
+
+        db.rebuild_fts = failed_rebuild
+
+        def repair():
+            try:
+                results.append(db._try_runtime_fts_rebuild(
+                    corruption,
+                    observed_generation=observed_generation,
+                ))
+            except Exception as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        winner = threading.Thread(target=repair)
+        waiter = threading.Thread(target=repair)
+        winner.start()
+        assert rebuild_entered.wait(timeout=2)
+        waiter.start()
+        release_rebuild.set()
+        winner.join(timeout=3)
+        waiter.join(timeout=3)
+
+        assert errors == []
+        assert not winner.is_alive() and not waiter.is_alive()
+        assert sorted(results) == [False, False]
+        assert db._fts_runtime_rebuild_attempted is True
+        assert db._fts_runtime_rebuild_in_progress is False
+        assert db._fts_runtime_rebuild_generation == observed_generation + 1
 
     def test_non_fts_errors_still_propagate(self, db):
         db.create_session("s1", source="test")
