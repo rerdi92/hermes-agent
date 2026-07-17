@@ -9,7 +9,7 @@ import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
-import { Activity, AlertCircle, Clock, Command, FolderOpen, Hash, Loader2, Terminal } from '@/lib/icons'
+import { Activity, AlertCircle, Clock, Command, FolderOpen, Hash, Loader2, Terminal, Zap, ZapFilled } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
@@ -18,6 +18,7 @@ import { revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
+  $agentFleetActive,
   $busy,
   $connection,
   $currentCwd,
@@ -26,7 +27,12 @@ import {
   $sessions,
   $sessionStartedAt,
   $turnStartedAt,
-  sessionMatchesStoredId
+  $ultraresearchActive,
+  $ultraworkActive,
+  sessionMatchesStoredId,
+  setAgentFleetActive,
+  setUltraresearchActive,
+  setUltraworkActive
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
@@ -79,6 +85,7 @@ export function useStatusbarItems({
   inferenceStatus,
   openAgents,
   openCommandCenterSection,
+  freshDraftReady,
   requestGateway,
   statusSnapshot,
   toggleCommandCenter
@@ -92,6 +99,9 @@ export function useStatusbarItems({
   const primaryBusy = useStore($busy)
   const currentCwd = useStore($currentCwd)
   const primaryUsage = useStore($currentUsage)
+  const agentFleetActive = useStore($agentFleetActive)
+  const ultraworkActive = useStore($ultraworkActive)
+  const ultraresearchActive = useStore($ultraresearchActive)
   const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
@@ -138,6 +148,7 @@ export function useStatusbarItems({
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
+  const showUltraModeToggles = gatewayState === 'open' && (!!activeSessionId || freshDraftReady)
 
   const gatewayMenuContent = useMemo(
     () => (close: () => void) => (
@@ -431,6 +442,48 @@ export function useStatusbarItems({
         hidden: gatewayState !== 'open'
       },
       {
+        className: cn('px-1', agentFleetActive && 'bg-(--chrome-action-hover) text-foreground'),
+        hidden: !showUltraModeToggles,
+        icon: agentFleetActive ? (
+          <ZapFilled className="size-3.5 shrink-0" />
+        ) : (
+          <Zap className="size-3.5 shrink-0 opacity-70" />
+        ),
+        id: 'agent-fleet',
+        label: 'FLT',
+        onSelect: () => setAgentFleetActive(current => !current),
+        title: agentFleetActive ? copy.agentFleetOn : copy.agentFleetOff,
+        variant: 'action'
+      },
+      {
+        className: cn('px-1', ultraworkActive && 'bg-(--chrome-action-hover) text-foreground'),
+        hidden: !showUltraModeToggles,
+        icon: ultraworkActive ? (
+          <ZapFilled className="size-3.5 shrink-0" />
+        ) : (
+          <Zap className="size-3.5 shrink-0 opacity-70" />
+        ),
+        id: 'ultrawork',
+        label: 'ULW',
+        onSelect: () => setUltraworkActive(current => !current),
+        title: ultraworkActive ? copy.ultraworkOn : copy.ultraworkOff,
+        variant: 'action'
+      },
+      {
+        className: cn('px-1', ultraresearchActive && 'bg-(--chrome-action-hover) text-foreground'),
+        hidden: !showUltraModeToggles,
+        icon: ultraresearchActive ? (
+          <ZapFilled className="size-3.5 shrink-0" />
+        ) : (
+          <Zap className="size-3.5 shrink-0 opacity-70" />
+        ),
+        id: 'ultraresearch',
+        label: 'ULR',
+        onSelect: () => setUltraresearchActive(current => !current),
+        title: ultraresearchActive ? copy.ultraresearchOn : copy.ultraresearchOff,
+        variant: 'action'
+      },
+      {
         actionId: 'view.showTerminal',
         className: `w-7 justify-center px-0${terminalTakeover ? ' bg-accent/55 text-foreground' : ''}`,
         hidden: !chatOpen,
@@ -457,8 +510,12 @@ export function useStatusbarItems({
       requestGateway,
       sessionStartedAt,
       gatewayState,
+      showUltraModeToggles,
       terminalTakeover,
-      turnStartedAt
+      turnStartedAt,
+      agentFleetActive,
+      ultraresearchActive,
+      ultraworkActive
     ]
   )
 

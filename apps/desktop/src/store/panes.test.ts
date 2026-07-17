@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  $paneHeightOverride,
   $paneOpen,
   $paneStates,
   $paneWidthOverride,
+  clearAllPaneSizeOverrides,
+  clearPaneHeightOverride,
   clearPaneWidthOverride,
   ensurePaneRegistered,
   getPaneStateSnapshot,
+  setPaneHeightOverride,
   setPaneOpen,
   setPaneWidthOverride,
   togglePane
@@ -71,40 +75,61 @@ describe('panes store', () => {
       expect(getPaneStateSnapshot('ephemeral')?.open).toBe(true)
     })
 
-    it('preserves widthOverride across open/close changes', () => {
+    it('preserves width and height overrides across open/close changes', () => {
       ensurePaneRegistered('files', { open: true })
       setPaneWidthOverride('files', 280)
+      setPaneHeightOverride('files', 320)
       setPaneOpen('files', false)
       setPaneOpen('files', true)
 
       expect(getPaneStateSnapshot('files')?.widthOverride).toBe(280)
+      expect(getPaneStateSnapshot('files')?.heightOverride).toBe(320)
     })
   })
 
-  describe('width overrides', () => {
-    it('setPaneWidthOverride stores the px value', () => {
+  describe('size overrides', () => {
+    it('stores width and height values in pixels', () => {
       ensurePaneRegistered('files', { open: true })
       setPaneWidthOverride('files', 300)
+      setPaneHeightOverride('files', 420)
 
       expect(getPaneStateSnapshot('files')?.widthOverride).toBe(300)
+      expect(getPaneStateSnapshot('files')?.heightOverride).toBe(420)
     })
 
-    it('clearPaneWidthOverride removes the override', () => {
+    it('clears individual width and height overrides', () => {
       ensurePaneRegistered('files', { open: true })
       setPaneWidthOverride('files', 300)
+      setPaneHeightOverride('files', 420)
       clearPaneWidthOverride('files')
+      clearPaneHeightOverride('files')
 
       expect(getPaneStateSnapshot('files')?.widthOverride).toBeUndefined()
+      expect(getPaneStateSnapshot('files')?.heightOverride).toBeUndefined()
     })
 
-    it('width override is NOT in-memory only, and is persisted across reloads', () => {
+    it('persists width and height overrides with the pane state', () => {
       ensurePaneRegistered('files', { open: true })
       setPaneWidthOverride('files', 300)
+      setPaneHeightOverride('files', 420)
 
       const persisted = window.localStorage.getItem(STORAGE_KEY)
 
       expect(persisted).not.toBeNull()
-      expect(JSON.parse(persisted ?? '{}')).toEqual({ files: { open: true, widthOverride: 300 } })
+      expect(JSON.parse(persisted ?? '{}')).toEqual({
+        files: { heightOverride: 420, open: true, widthOverride: 300 }
+      })
+    })
+
+    it('clears every size override without changing pane open state', () => {
+      ensurePaneRegistered('files', { open: true })
+      ensurePaneRegistered('terminal', { open: false })
+      setPaneWidthOverride('files', 300)
+      setPaneHeightOverride('terminal', 420)
+
+      clearAllPaneSizeOverrides()
+
+      expect($paneStates.get()).toEqual({ files: { open: true }, terminal: { open: false } })
     })
 
     it('open flag is persisted across changes', () => {
@@ -130,13 +155,17 @@ describe('panes store', () => {
       expect(open$.get()).toBe(false)
     })
 
-    it('$paneWidthOverride reflects the width', () => {
+    it('size override atoms reflect width and height', () => {
       const width$ = $paneWidthOverride('files')
+      const height$ = $paneHeightOverride('files')
       expect(width$.get()).toBeUndefined()
+      expect(height$.get()).toBeUndefined()
 
       ensurePaneRegistered('files', { open: true })
       setPaneWidthOverride('files', 240)
+      setPaneHeightOverride('files', 360)
       expect(width$.get()).toBe(240)
+      expect(height$.get()).toBe(360)
     })
 
     it('$paneOpen returns the same atom instance for repeated calls', () => {

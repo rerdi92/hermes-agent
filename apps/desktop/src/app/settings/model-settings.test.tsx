@@ -23,7 +23,8 @@ const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
 const startManualProviderOAuth = vi.fn()
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getGlobalModelInfo: () => getGlobalModelInfo(),
   getGlobalModelOptions: () => getGlobalModelOptions(),
   getAuxiliaryModels: () => getAuxiliaryModels(),
@@ -64,6 +65,7 @@ beforeEach(() => {
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
   saveHermesConfig.mockResolvedValue({ ok: true })
+  saveMoaModels.mockResolvedValue({ ok: true })
 })
 
 afterEach(() => {

@@ -56,6 +56,20 @@ import {
 } from './connection-config'
 import { adoptServedDashboardToken } from './dashboard-token'
 import {
+  type BackendShutdownTarget,
+  createDesktopRelaunchLifecycle,
+  createDesktopStartupFence,
+  createGracefulRelaunchCoordinator,
+  decideDesktopRelaunchPreflight,
+  ensureDesktopOwnedStartup,
+  invalidateDesktopOwnedStartupEntry,
+  isBackendChildRunning,
+  requestBackendGroupShutdown,
+  requestRelaunchWithRecovery,
+  runOperationWithPostRelease,
+  runRelaunchQuitHandoff
+} from './desktop-relaunch'
+import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
   modeRemovesAgent,
@@ -390,6 +404,10 @@ const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-sta
 // ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
+// File-backed session pins bridge. The renderer still owns the visible sidebar
+// state/localStorage, but external automation can update this JSON file and the
+// running Desktop process will push the new ids into the renderer immediately.
+const DESKTOP_PINNED_SESSIONS_PATH = path.join(app.getPath('userData'), 'pinned-sessions.json')
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
@@ -403,6 +421,13 @@ const DEFAULT_UPDATE_BRANCH = 'main'
 const DESKTOP_LOG_PATH = path.join(HERMES_HOME, 'logs', 'desktop.log')
 const DESKTOP_LOG_FLUSH_MS = 120
 const DESKTOP_LOG_BUFFER_MAX_CHARS = 64 * 1024
+// Startup readiness is different from normal API calls: after a rebuild or
+// cold Windows launch, the dashboard can bind its port before /api/status is
+// responsive. Keep the overall boot window generous, but make each probe short
+// so one slow request does not consume a third of the whole startup budget.
+const BACKEND_READY_TIMEOUT_MS = 90_000
+const BACKEND_READY_PROBE_TIMEOUT_MS = 2_000
+const BACKEND_READY_POLL_MS = 500
 // Bound desktop.log on disk. It is an append-only forensic log, so a boot loop
 // (version-skew crash -> backend exits instantly -> renderer keeps hitting
 // Retry) appends the full bootstrap transcript every attempt and grows without
@@ -811,6 +836,8 @@ function registerMediaProtocol() {
 
 let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
+let primaryShutdownTarget: BackendShutdownTarget | null = null
+let primaryConnectionMode: null | 'local' | 'remote' = null
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -820,7 +847,7 @@ let softRehomeInProgress = false
 // backends spawned lazily when a session belongs to a different profile. A user
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
-const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+const backendPool = new Map() // profile -> { process, port, token, shutdownFile, connectionPromise, lastActiveAt }
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1828,6 +1855,13 @@ function makeDashboardReadyFile() {
   return path.join(dir, `dashboard-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.json`)
 }
 
+function makeDesktopShutdownFile() {
+  const dir = path.join(app.getPath('userData'), 'backend-shutdown')
+  fs.mkdirSync(dir, { recursive: true })
+
+  return path.join(dir, `backend-${process.pid}-${Date.now()}-${crypto.randomBytes(12).toString('hex')}.json`)
+}
+
 // resolveGitBinary — locate git.exe on Windows. A fresh installer-driven
 // install only has PortableGit under %LOCALAPPDATA%\hermes\git (never on
 // PATH), so a bare spawn('git') ENOENTs and self-update checks fail with
@@ -2183,6 +2217,7 @@ async function readCommitLog(cwd, branch) {
 }
 
 let updateInFlight = false
+let uninstallInFlight = false
 
 // Set to true when the desktop is about to quit so a detached swap/install/
 // uninstall script can take over. On macOS, app.quit() closes windows but
@@ -2423,6 +2458,27 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
+  const result = await runOperationWithPostRelease(
+    gracefulDesktopRelaunch,
+    'update',
+    () => applyUpdatesImpl(opts),
+    updateResult => {
+      if (updateResult && 'restartBackendAfterLease' in updateResult && updateResult.restartBackendAfterLease) {
+        startHermes().catch(error => rememberLog(`[update] backend recovery failed: ${error.message}`))
+      }
+    }
+  )
+
+  if (!result || !('restartBackendAfterLease' in result) || !result.restartBackendAfterLease) {
+    return result
+  }
+
+  const { restartBackendAfterLease: _restartBackendAfterLease, ...publicResult } = result
+
+  return publicResult
+}
+
+async function applyUpdatesImpl(opts = {}) {
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }
@@ -2513,9 +2569,9 @@ async function applyUpdates(opts = {}) {
         '(a second Hermes window or a terminal running hermes?). Close it and retry.'
 
       emitUpdateProgress({ stage: 'error', message, percent: null })
-      startHermes().catch(() => {})
+      resetHermesConnection()
 
-      return { ok: false, error: message }
+      return { ok: false, error: message, restartBackendAfterLease: true }
     }
 
     // Detached so the updater outlives this process — it needs us GONE before
@@ -2563,7 +2619,17 @@ async function applyUpdates(opts = {}) {
   }
 }
 
-async function handOffWindowsBootstrapRecovery(reason) {
+async function handOffWindowsBootstrapRecovery(reason, activeLease: (() => void) | null = null) {
+  if (activeLease) {
+    return handOffWindowsBootstrapRecoveryImpl(reason, activeLease)
+  }
+
+  return gracefulDesktopRelaunch.runOperation('bootstrap recovery', assertActive =>
+    handOffWindowsBootstrapRecoveryImpl(reason, assertActive)
+  )
+}
+
+async function handOffWindowsBootstrapRecoveryImpl(reason, assertActive) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
     return false
   }
@@ -2580,6 +2646,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     : configuredBranch || DEFAULT_UPDATE_BRANCH
+  assertActive()
 
   const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
   const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
@@ -2597,6 +2664,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const updaterArgs = chooseUpdaterArgs(haveRealInstall, branch)
 
   await releaseBackendLockForUpdate(updateRoot)
+  assertActive()
 
   const child = spawn(updater, updaterArgs, {
     cwd: HERMES_HOME,
@@ -3450,7 +3518,7 @@ function resolveHermesBackend(backendArgs) {
   }
 }
 
-async function ensureRuntime(backend) {
+async function ensureRuntime(backend, activeLease: (() => void) | null = null) {
   if (!backend.bootstrap) {
     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
 
@@ -3469,7 +3537,7 @@ async function ensureRuntime(backend) {
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
 
-    if (await handOffWindowsBootstrapRecovery('bootstrap-needed')) {
+    if (await handOffWindowsBootstrapRecovery('bootstrap-needed', activeLease)) {
       const handoffError: Error & { isBootstrapFailure?: boolean; bootstrapHandedOff?: boolean } = new Error(
         'Hermes recovery was handed off to Hermes Setup. The desktop will restart when recovery completes.'
       )
@@ -3555,7 +3623,7 @@ async function ensureRuntime(backend) {
 
     // Re-resolve now that the install exists. The new resolution lands in
     // step 3 (bootstrap-complete marker) and we recurse to wire venvPython.
-    return ensureRuntime(resolveHermesBackend(backend.args))
+    return ensureRuntime(resolveHermesBackend(backend.args), activeLease)
   }
 
   // bootstrap=true with a real backend (createActiveBackend path) means we
@@ -4435,18 +4503,25 @@ function closePreviewWatchers() {
   }
 }
 
-async function waitForHermes(baseUrl, token) {
-  const deadline = Date.now() + 45_000
+async function waitForHermes(
+  baseUrl,
+  token,
+  options: { pollMs?: number; probeTimeoutMs?: number; timeoutMs?: number } = {}
+) {
+  const timeoutMs = options.timeoutMs ?? BACKEND_READY_TIMEOUT_MS
+  const probeTimeoutMs = options.probeTimeoutMs ?? BACKEND_READY_PROBE_TIMEOUT_MS
+  const pollMs = options.pollMs ?? BACKEND_READY_POLL_MS
+  const deadline = Date.now() + timeoutMs
   let lastError = null
 
   while (Date.now() < deadline) {
     try {
-      await fetchJson(`${baseUrl}/api/status`, token)
+      await fetchJson(`${baseUrl}/api/status`, token, { timeoutMs: probeTimeoutMs })
 
       return
     } catch (error) {
       lastError = error
-      await new Promise(resolve => setTimeout(resolve, 500))
+      await new Promise(resolve => setTimeout(resolve, pollMs))
     }
   }
 
@@ -4476,7 +4551,7 @@ function getWindowState() {
 function sendBackendExit(payload) {
   // Intentional soft re-home (gateway mode apply) kills the child on purpose —
   // don't surface the "backend stopped" error toast / boot-failure path.
-  if (softRehomeInProgress) {
+  if (softRehomeInProgress || gracefulDesktopRelaunch.active) {
     return
   }
 
@@ -4595,6 +4670,12 @@ function buildApplicationMenu() {
     label: 'Check for Updates…',
     click: () => sendOpenUpdatesRequested()
   }
+  const restartHermesItem = {
+    label: `Restart ${APP_NAME}`,
+    click: () => {
+      void requestGracefulDesktopRelaunchWithFeedback()
+    }
+  }
 
   if (IS_MAC) {
     template.push({
@@ -4617,6 +4698,8 @@ function buildApplicationMenu() {
   template.push({
     label: 'File',
     submenu: [
+      restartHermesItem,
+      { type: 'separator' },
       IS_MAC
         ? {
             // NO accelerator: on macOS a registered ⌘W is consumed by the OS
@@ -5890,6 +5973,75 @@ function writeActiveDesktopProfile(name) {
   return value || null
 }
 
+function sanitizePinnedSessionIds(value) {
+  const rawIds = Array.isArray(value) ? value : Array.isArray(value?.ids) ? value.ids : []
+  const seen = new Set()
+  const ids = []
+
+  for (const item of rawIds) {
+    const id = typeof item === 'string' ? item.trim() : ''
+
+    if (id && !seen.has(id)) {
+      seen.add(id)
+      ids.push(id)
+    }
+  }
+
+  return ids
+}
+
+function readDesktopPinnedSessions() {
+  try {
+    const raw = fs.readFileSync(DESKTOP_PINNED_SESSIONS_PATH, 'utf8')
+
+    return { exists: true, ids: sanitizePinnedSessionIds(JSON.parse(raw)), path: DESKTOP_PINNED_SESSIONS_PATH }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      rememberLog(`[pins] failed to read ${DESKTOP_PINNED_SESSIONS_PATH}: ${error?.message || error}`)
+    }
+
+    return { exists: false, ids: [], path: DESKTOP_PINNED_SESSIONS_PATH }
+  }
+}
+
+function writeDesktopPinnedSessions(ids) {
+  const nextIds = sanitizePinnedSessionIds(ids)
+
+  fs.mkdirSync(path.dirname(DESKTOP_PINNED_SESSIONS_PATH), { recursive: true })
+  writeFileAtomic(
+    DESKTOP_PINNED_SESSIONS_PATH,
+    JSON.stringify({ ids: nextIds, updated_at: new Date().toISOString(), source: 'desktop' }, null, 2)
+  )
+
+  return { exists: true, ids: nextIds, path: DESKTOP_PINNED_SESSIONS_PATH }
+}
+
+function broadcastPinnedSessionsChanged() {
+  const payload = readDesktopPinnedSessions()
+
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send('hermes:pinnedSessions:changed', payload)
+    }
+  }
+}
+
+let pinnedSessionsWatcherStarted = false
+
+function ensurePinnedSessionsWatcher() {
+  if (pinnedSessionsWatcherStarted) {
+    return
+  }
+
+  pinnedSessionsWatcherStarted = true
+  fs.mkdirSync(path.dirname(DESKTOP_PINNED_SESSIONS_PATH), { recursive: true })
+  fs.watchFile(DESKTOP_PINNED_SESSIONS_PATH, { interval: 750 }, (curr, prev) => {
+    if (curr.mtimeMs !== prev.mtimeMs || curr.size !== prev.size) {
+      broadcastPinnedSessionsChanged()
+    }
+  })
+}
+
 // Sanitize a connection config into the renderer-facing shape. With no
 // `profile` this describes the global/default connection (the existing
 // behavior); with a `profile` it describes that profile's per-profile remote
@@ -6341,6 +6493,10 @@ function resetBootProgressForReconnect() {
 }
 
 function stopBackendChild(child) {
+  if (!isBackendChildRunning(child) || child.killed) {
+    return
+  }
+
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
@@ -6349,8 +6505,11 @@ function stopBackendChild(child) {
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
+  primaryStartupFence.invalidate()
+  primaryConnectionMode = null
   backendStartFailure = null
   const hermesProcess = backendConnectionState.invalidate()
+  primaryShutdownTarget = null
   stopBackendChild(hermesProcess)
 
   if (!soft) {
@@ -6426,6 +6585,133 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   })
 }
 
+function ownedBackendShutdownTargets(): BackendShutdownTarget[] {
+  const targets: BackendShutdownTarget[] = []
+  const hermesProcess = backendConnectionState.getProcess()
+
+  if (hermesProcess) {
+    targets.push(
+      primaryShutdownTarget?.child === hermesProcess
+        ? primaryShutdownTarget
+        : { child: hermesProcess, label: 'primary', markerPath: '' }
+    )
+  }
+
+  for (const [profile, entry] of backendPool.entries()) {
+    if (entry.process) {
+      targets.push({
+        child: entry.process,
+        label: `profile:${profile}`,
+        markerPath: entry.shutdownFile || ''
+      })
+    }
+  }
+
+  return targets
+}
+
+function gracefulDesktopRelaunchPreflight() {
+  const connectionPromise = backendConnectionState.getPromise()
+  const hermesProcess = backendConnectionState.getProcess()
+
+  return decideDesktopRelaunchPreflight({
+    activeTerminalCount: terminalSessions.size,
+    bootstrapActive: bootstrapState.active,
+    handoffActive: isQuittingForHandoff || uninstallInFlight,
+    hasConnectionPromise: connectionPromise !== null,
+    hasLocalBackendChild: hermesProcess !== null,
+    primaryConnectionMode,
+    unresolvedPoolCount: [...backendPool.values()].filter(entry => entry.starting).length,
+    updateInFlight
+  })
+}
+
+const coordinateGracefulDesktopRelaunch = createGracefulRelaunchCoordinator({
+  getTargets: ownedBackendShutdownTargets,
+  preflight: gracefulDesktopRelaunchPreflight,
+  quit: () =>
+    runRelaunchQuitHandoff({
+      markRelaunching: () => gracefulDesktopRelaunch.markRelaunching(),
+      quit: () => app.quit(),
+      setHandoffActive: active => {
+        isQuittingForHandoff = active
+      }
+    }),
+  relaunch: () => app.relaunch(),
+  shutdownTargets: targets => requestBackendGroupShutdown(targets)
+})
+const gracefulDesktopRelaunch = createDesktopRelaunchLifecycle(coordinateGracefulDesktopRelaunch, {
+  isHandoffActive: () => isQuittingForHandoff,
+  isRelaunchPending: () => coordinateGracefulDesktopRelaunch.relaunchIssued
+})
+const primaryStartupFence = createDesktopStartupFence(gracefulDesktopRelaunch)
+
+async function requestGracefulDesktopRelaunch() {
+  let result
+
+  try {
+    result = await requestRelaunchWithRecovery(gracefulDesktopRelaunch, async assertActive => {
+      rememberLog('[relaunch] relaunch handoff failed after backend drain; recovering the primary backend')
+
+      try {
+        await startHermes(assertActive)
+      } catch (error) {
+        rememberLog(`[relaunch] primary backend recovery failed: ${error.message}`)
+      }
+    })
+  } catch (error) {
+    rememberLog(`[relaunch] unexpected graceful relaunch failure: ${error.message}`)
+
+    return { ok: false, reason: 'relaunch-failed' }
+  }
+
+  if (!result.ok) {
+    rememberLog(`[relaunch] graceful relaunch blocked: ${result.reason}`)
+  } else {
+    rememberLog('[relaunch] all owned backends exited cleanly; relaunch scheduled')
+  }
+
+  return result
+}
+
+async function requestGracefulDesktopRelaunchWithFeedback() {
+  const result = await requestGracefulDesktopRelaunch()
+
+  if (result.ok) {
+    return result
+  }
+
+  const detail =
+    result.reason === 'active-terminals'
+      ? 'Close active terminal tabs, then try again. Hermes did not quit.'
+      : result.reason === 'bootstrap-active'
+        ? 'Wait for setup to finish or cancel it, then try again. Hermes did not quit.'
+        : result.reason === 'update-active' || result.reason === 'handoff-active'
+          ? 'Wait for the update, uninstall, or other desktop handoff to finish. Hermes did not quit.'
+          : result.reason === 'operation-active'
+            ? 'Wait for the current desktop lifecycle operation to finish, then try again. Hermes did not quit.'
+            : result.reason === 'relaunch-active'
+              ? 'A safe restart is already in progress.'
+              : result.reason === 'pool-starting' || result.reason === 'backend-starting'
+                ? 'Wait for the backend connection to finish starting, then try again. Hermes did not quit.'
+                : result.reason === 'backend-drain-failed'
+                  ? 'A local backend did not exit cleanly before the deadline. Hermes did not quit or force-kill it.'
+                  : result.reason === 'quit-failed-after-relaunch'
+                    ? 'A restart is already scheduled, but Hermes could not quit. The backend was recovered; try Restart Hermes again to finish without scheduling another instance.'
+                    : 'Hermes could not schedule a safe relaunch and remained open.'
+
+  await dialog.showMessageBox({
+    type: 'warning',
+    title: `${APP_NAME} restart blocked`,
+    message: 'Could not restart safely',
+    detail
+  })
+
+  return result
+}
+
+ipcMain.handle('hermes:desktop:restart', () => requestGracefulDesktopRelaunchWithFeedback())
+
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
 // returns the desktop's stored preference, or null when unset (legacy launch
 // that defers to active_profile / default).
@@ -6437,11 +6723,13 @@ function primaryProfileKey() {
 // profile to startHermes() (the window backend: boot UI, bootstrap, remote
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
-async function ensureBackend(profile) {
+async function ensureBackend(profile, activeLease: (() => void) | null = null) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   if (key === primaryProfileKey()) {
-    return startHermes()
+    activeLease?.()
+
+    return startHermes(activeLease)
   }
 
   const existing = backendPool.get(key)
@@ -6452,17 +6740,30 @@ async function ensureBackend(profile) {
     return existing.connectionPromise
   }
 
-  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
-
-  const entry = { process: null, port: null, token: null, connectionPromise: null, lastActiveAt: Date.now() }
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
-    throw error
+  const connectionPromise = ensureDesktopOwnedStartup({
+    activeLease,
+    beforeStart: assertLease => evictLruPoolBackends(POOL_MAX_BACKENDS - 1, assertLease),
+    createEntry: () => ({
+      process: null,
+      port: null,
+      token: null,
+      shutdownFile: null,
+      starting: true,
+      startupOwner: null,
+      connectionPromise: null,
+      lastActiveAt: Date.now()
+    }),
+    entries: backendPool,
+    key,
+    label: `profile backend "${key}"`,
+    lifecycle: gracefulDesktopRelaunch,
+    operation: 'pool backend startup',
+    start: (entry, assertCurrent) => spawnPoolBackend(key, entry, assertCurrent)
   })
-  backendPool.set(key, entry)
+
   startPoolIdleReaper()
 
-  return entry.connectionPromise
+  return connectionPromise
 }
 
 // Mark a pool profile as recently used so the idle reaper spares it. The
@@ -6486,27 +6787,52 @@ function touchPoolBackend(profile) {
 // ever evict backends without a live renderer socket (stale beyond the keepalive
 // window). When every backend is actively kept alive we let the pool exceed the
 // soft cap rather than kill a running session.
-function evictLruPoolBackends(keep) {
+async function evictLruPoolBackends(keep, activeLease: (() => void) | null = null) {
   if (backendPool.size <= keep) {
     return
   }
 
+  const evict = async (assertActive: () => void) => {
+    assertActive()
+    const now = Date.now()
+
+    const evictable = [...backendPool.entries()]
+      .filter(([, entry]) => now - (entry.lastActiveAt || 0) > POOL_KEEPALIVE_FRESH_MS)
+      .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
+
+    let removable = backendPool.size - Math.max(0, keep)
+
+    for (const [profile] of evictable) {
+      if (removable <= 0) {
+        break
+      }
+      rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${POOL_MAX_BACKENDS})`)
+      await teardownPoolBackendAndWait(profile)
+      assertActive()
+      removable -= 1
+    }
+  }
+
+  if (activeLease) {
+    return evict(activeLease)
+  }
+
+  return gracefulDesktopRelaunch.runOperation('pool LRU eviction', evict)
+}
+
+async function reapIdlePoolBackends() {
   const now = Date.now()
 
-  const evictable = [...backendPool.entries()]
-    .filter(([, entry]) => now - (entry.lastActiveAt || 0) > POOL_KEEPALIVE_FRESH_MS)
-    .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
-
-  let removable = backendPool.size - Math.max(0, keep)
-
-  for (const [profile] of evictable) {
-    if (removable <= 0) {
-      break
+  for (const [profile, entry] of [...backendPool.entries()]) {
+    if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
+      rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
+      await teardownPoolBackendAndWait(profile)
     }
+  }
 
-    rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${POOL_MAX_BACKENDS})`)
-    stopPoolBackend(profile)
-    removable -= 1
+  if (backendPool.size === 0 && poolIdleReaper) {
+    clearInterval(poolIdleReaper)
+    poolIdleReaper = null
   }
 }
 
@@ -6516,19 +6842,13 @@ function startPoolIdleReaper() {
   }
 
   poolIdleReaper = setInterval(() => {
-    const now = Date.now()
-
-    for (const [profile, entry] of [...backendPool.entries()]) {
-      if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
-        rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
-        stopPoolBackend(profile)
-      }
+    if (gracefulDesktopRelaunch.active) {
+      return
     }
 
-    if (backendPool.size === 0 && poolIdleReaper) {
-      clearInterval(poolIdleReaper)
-      poolIdleReaper = null
-    }
+    void gracefulDesktopRelaunch
+      .runOperation('pool idle reaper', reapIdlePoolBackends)
+      .catch(error => rememberLog(`Pool idle reaper failed: ${error.message}`))
   }, 60_000)
 
   if (typeof poolIdleReaper.unref === 'function') {
@@ -6539,7 +6859,7 @@ function startPoolIdleReaper() {
 // Spawn an additional dashboard backend pinned to a named profile. Mirrors the
 // local-spawn portion of startHermes() but without the boot-progress UI,
 // bootstrap, or remote handling (those belong to the primary backend only).
-async function spawnPoolBackend(profile, entry) {
+async function spawnPoolBackend(profile, entry, assertCurrent: () => void) {
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
   // In either case there is no local child to spawn — we just verify the
@@ -6547,9 +6867,11 @@ async function spawnPoolBackend(profile, entry) {
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
   const remote = await resolveRemoteBackend(profile)
+  assertCurrent()
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token)
+    assertCurrent()
 
     return {
       ...remote,
@@ -6564,14 +6886,17 @@ async function spawnPoolBackend(profile, entry) {
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  const backend = await ensureRuntime(resolveHermesBackend(backendArgs), assertCurrent)
+  assertCurrent()
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  const shutdownFile = makeDesktopShutdownFile()
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+  assertCurrent()
 
   const child = spawn(
     backend.command,
@@ -6590,6 +6915,7 @@ async function spawnPoolBackend(profile, entry) {
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
+        HERMES_DESKTOP_SHUTDOWN_FILE: shutdownFile,
         HERMES_WEB_DIST: webDist,
         ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
       },
@@ -6600,6 +6926,7 @@ async function spawnPoolBackend(profile, entry) {
 
   entry.process = child
   entry.token = token
+  entry.shutdownFile = shutdownFile
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -6613,12 +6940,12 @@ async function spawnPoolBackend(profile, entry) {
 
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
-    backendPool.delete(profile)
+    invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
-    backendPool.delete(profile)
+    invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
 
     if (!ready) {
       rejectStart?.(
@@ -6629,6 +6956,7 @@ async function spawnPoolBackend(profile, entry) {
 
   // Discover the ephemeral port the child bound to
   const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), startFailed])
+  assertCurrent()
 
   if (readyFile) {
     fs.unlink(readyFile, () => {})
@@ -6638,13 +6966,15 @@ async function spawnPoolBackend(profile, entry) {
 
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
+  assertCurrent()
   ready = true
 
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
-    childAlive: () => child.exitCode === null && !child.killed,
+    childAlive: () => entry.startupOwner?.isCurrent() === true && child.exitCode === null && !child.killed,
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
   })
+  assertCurrent()
 
   entry.token = authToken
 
@@ -6667,8 +6997,7 @@ function stopPoolBackend(profile) {
   if (!entry) {
     return
   }
-
-  backendPool.delete(profile)
+  invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
   stopBackendChild(entry.process)
 }
 
@@ -6678,8 +7007,7 @@ async function teardownPoolBackendAndWait(profile) {
   if (!entry) {
     return
   }
-
-  backendPool.delete(profile)
+  invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
 
   stopBackendChild(entry.process)
 
@@ -6726,7 +7054,7 @@ async function prepareProfileDeleteRequest(request) {
   return decision.profile
 }
 
-async function startHermes() {
+async function startHermes(activeLease: (() => void) | null = null) {
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -6747,245 +7075,285 @@ async function startHermes() {
     return existingConnectionPromise
   }
 
+  if (activeLease) {
+    activeLease()
+  } else {
+    gracefulDesktopRelaunch.assertOperationAllowed('backend startup')
+  }
+
   const connectionAttempt = backendConnectionState.startAttempt()
+  const runPrimaryStartup = (assertLease: () => void) => {
+    const generation = primaryStartupFence.begin()
+    const assertPrimaryStartupCurrent = () => {
+      assertLease()
+      primaryStartupFence.assertCurrent(generation)
+    }
 
-  // Classify this boot BEFORE the throwing resolve/mint runs: a remote failure
-  // must NOT latch (it's transient — see shouldLatchBackendStartFailure), while
-  // a local failure latches to break install-restart loops.
-  let attemptedRemote = primaryBackendIsRemote()
+    // Classify this boot BEFORE the throwing resolve/mint runs: a remote failure
+    // must NOT latch (it's transient — see shouldLatchBackendStartFailure), while
+    // a local failure latches to break install-restart loops.
+    let attemptedRemote = primaryBackendIsRemote()
 
-  const connectionPromise = (async () => {
-    await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
-    // Resolve for the desktop's primary profile so a per-profile remote
-    // override on the active profile is honored (falls back to env / global).
-    // Re-read once resolved so the classification tracks the value actually used.
-    attemptedRemote = primaryBackendIsRemote()
-    const remote = await resolveRemoteBackend(primaryProfileKey())
+    return (async () => {
+      await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+      assertPrimaryStartupCurrent()
+      // Resolve for the desktop's primary profile so a per-profile remote
+      // override on the active profile is honored (falls back to env / global).
+      // Re-read before resolve so the classification tracks the value actually used.
+      attemptedRemote = primaryBackendIsRemote()
+      const remote = await resolveRemoteBackend(primaryProfileKey())
+      assertPrimaryStartupCurrent()
 
-    if (remote) {
-      await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      if (remote) {
+        await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
+        assertPrimaryStartupCurrent()
+        await waitForHermes(remote.baseUrl, remote.token)
+        assertPrimaryStartupCurrent()
+        primaryConnectionMode = 'remote'
+        updateBootProgress({
+          phase: 'backend.ready',
+          message: 'Remote Hermes backend is ready',
+          progress: 94,
+          running: true,
+          error: null
+        })
+
+        return {
+          baseUrl: remote.baseUrl,
+          mode: 'remote',
+          source: remote.source,
+          authMode: remote.authMode || 'token',
+          token: remote.token,
+          wsUrl: remote.wsUrl,
+          logs: hermesLog.slice(-80),
+          ...getWindowState()
+        }
+      }
+
+      // Mutual exclusion with an in-app update (#50238). If this instance was
+      // relaunched while the Tauri updater is still applying an update, spawning
+      // a local backend now re-locks the venv shim and gets killed by the
+      // updater's straggler cleanup — looping. Park until the update finishes (or
+      // is detected stale), THEN start the backend. Local backends only; remote
+      // connections returned above and never touch the install tree.
+      await waitForUpdateToFinish()
+      assertPrimaryStartupCurrent()
+
+      const token = crypto.randomBytes(32).toString('base64url')
+      // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+      const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
+      // Pin the desktop's chosen profile via the global --profile flag. This is
+      // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
+      // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
+      // unset preference keeps the legacy launch so existing installs are
+      // unaffected.
+      const activeProfile = readActiveDesktopProfile()
+
+      if (activeProfile) {
+        backendArgs.unshift('--profile', activeProfile)
+      }
+
+      await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+      assertPrimaryStartupCurrent()
+      const backend = await ensureRuntime(resolveHermesBackend(backendArgs), assertPrimaryStartupCurrent)
+      assertPrimaryStartupCurrent()
+      // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
+      backend.args = getBackendArgsForRuntime(backend)
+      const hermesCwd = resolveHermesCwd()
+      const webDist = resolveWebDist()
+      const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+      const shutdownFile = makeDesktopShutdownFile()
+
+      await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+      assertPrimaryStartupCurrent()
+      rememberLog(`Starting Hermes backend via ${backend.label}`)
+
+      const child = spawn(
+        backend.command,
+        backend.args,
+        hiddenWindowsChildOptions({
+          cwd: hermesCwd,
+          env: {
+            ...process.env,
+            // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
+            // resolves to the SAME location our resolveHermesHome() picked. Without
+            // this pin, Python falls back to ~/.hermes on every platform — fine on
+            // mac/linux (where our default matches), but on Windows our default is
+            // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
+            // Mismatch would split config / sessions / .env / logs across two
+            // directories. install.ps1 sets HERMES_HOME via setx; the desktop
+            // can't reliably do that, so we set it inline for every spawn.
+            HERMES_HOME,
+            ...backend.env,
+            TERMINAL_CWD: hermesCwd,
+            HERMES_DASHBOARD_SESSION_TOKEN: token,
+            // Marks this dashboard backend as desktop-spawned so it runs the cron
+            // scheduler tick loop (the gateway isn't running under the app).
+            HERMES_DESKTOP: '1',
+            HERMES_DESKTOP_SHUTDOWN_FILE: shutdownFile,
+            HERMES_WEB_DIST: webDist,
+            ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
+          },
+          shell: backend.shell,
+          stdio: ['ignore', 'pipe', 'pipe']
+        })
+      )
+      const processOwner = backendConnectionState.attachProcess(connectionAttempt, child)
+
+      if (!processOwner) {
+        stopBackendChild(child)
+        throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+      }
+
+      primaryShutdownTarget = { child, label: 'primary', markerPath: shutdownFile }
+      child.stdout.on('data', rememberLog)
+      child.stderr.on('data', rememberLog)
+      let backendReady = false
+      let rejectBackendStart = null
+
+      const backendStartFailed = new Promise((_resolve, reject) => {
+        rejectBackendStart = reject
+      })
+
+      child.once('error', error => {
+        if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
+          rememberLog(`Ignoring stale Hermes backend error: ${error.message}`)
+          rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
+
+          return
+        }
+
+        rememberLog(`Hermes backend failed to start: ${error.message}`)
+        primaryShutdownTarget = null
+        primaryConnectionMode = null
+        updateBootProgress(
+          {
+            error: error.message,
+            message: `Hermes backend failed to start: ${error.message}`,
+            phase: 'backend.error',
+            running: false
+          },
+          { allowDecrease: true }
+        )
+        sendBackendExit({ code: null, signal: null, error: error.message })
+        rejectBackendStart?.(error)
+      })
+      child.once('exit', (code, signal) => {
+        if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
+          rememberLog(`Ignoring stale Hermes backend exit (${signal || code})`)
+
+          if (!backendReady) {
+            rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
+          }
+
+          return
+        }
+
+        rememberLog(`Hermes backend exited (${signal || code})`)
+        primaryShutdownTarget = null
+        primaryConnectionMode = null
+        sendBackendExit({ code, signal })
+
+        if (!backendReady) {
+          const message = `Hermes backend exited before it became ready (${signal || code}).`
+          updateBootProgress(
+            {
+              error: message,
+              message,
+              phase: 'backend.error',
+              running: false
+            },
+            { allowDecrease: true }
+          )
+
+          rejectBackendStart?.(
+            new Error(
+              `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
+            )
+          )
+        }
+      })
+
+      await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+      assertPrimaryStartupCurrent()
+
+      // Discover the ephemeral port the child bound to
+      const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), backendStartFailed])
+      assertPrimaryStartupCurrent()
+
+      if (readyFile) {
+        fs.unlink(readyFile, () => {})
+      }
+
+      const baseUrl = `http://127.0.0.1:${port}`
+      await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
+      assertPrimaryStartupCurrent()
+      await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
+      assertPrimaryStartupCurrent()
+
+      const authToken = await adoptServedDashboardToken(baseUrl, token, {
+        childAlive: () =>
+          primaryStartupFence.isCurrent(generation) &&
+          backendConnectionState.getProcess() === child &&
+          child.exitCode === null &&
+          !child.killed,
+        rememberLog
+      })
+      assertPrimaryStartupCurrent()
+      backendReady = true
+      backendStartFailure = null
+      primaryConnectionMode = 'local'
+
       updateBootProgress({
         phase: 'backend.ready',
-        message: 'Remote Hermes backend is ready',
+        message: 'Hermes backend is ready. Finalizing desktop startup',
         progress: 94,
         running: true,
         error: null
       })
 
       return {
-        baseUrl: remote.baseUrl,
-        mode: 'remote',
-        source: remote.source,
-        authMode: remote.authMode || 'token',
-        token: remote.token,
-        wsUrl: remote.wsUrl,
+        baseUrl,
+        mode: 'local',
+        source: 'local',
+        authMode: 'token',
+        token: authToken,
+        wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
         logs: hermesLog.slice(-80),
         ...getWindowState()
       }
-    }
-
-    // Mutual exclusion with an in-app update (#50238). If this instance was
-    // relaunched while the Tauri updater is still applying an update, spawning
-    // a local backend now re-locks the venv shim and gets killed by the
-    // updater's straggler cleanup — looping. Park until the update finishes (or
-    // is detected stale), THEN start the backend. Local backends only; remote
-    // connections returned above and never touch the install tree.
-    await waitForUpdateToFinish()
-
-    const token = crypto.randomBytes(32).toString('base64url')
-    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
-
-    await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
-    const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
-    // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-    backend.args = getBackendArgsForRuntime(backend)
-    const hermesCwd = resolveHermesCwd()
-    const webDist = resolveWebDist()
-    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
-
-    await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
-    rememberLog(`Starting Hermes backend via ${backend.label}`)
-
-    const hermesProcess = spawn(
-      backend.command,
-      backend.args,
-      hiddenWindowsChildOptions({
-        cwd: hermesCwd,
-        env: {
-          ...process.env,
-          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-          // resolves to the SAME location our resolveHermesHome() picked. Without
-          // this pin, Python falls back to ~/.hermes on every platform — fine on
-          // mac/linux (where our default matches), but on Windows our default is
-          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-          // Mismatch would split config / sessions / .env / logs across two
-          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-          // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME,
-          ...backend.env,
-          TERMINAL_CWD: hermesCwd,
-          HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          HERMES_WEB_DIST: webDist,
-          ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
-        },
-        shell: backend.shell,
-        stdio: ['ignore', 'pipe', 'pipe']
-      })
-    )
-
-    const processOwner = backendConnectionState.attachProcess(connectionAttempt, hermesProcess)
-
-    if (!processOwner) {
-      stopBackendChild(hermesProcess)
-      throw new Error('Hermes backend start was superseded by a newer connection attempt.')
-    }
-
-    hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
-    let backendReady = false
-    let rejectBackendStart = null
-
-    const backendStartFailed = new Promise((_resolve, reject) => {
-      rejectBackendStart = reject
-    })
-
-    hermesProcess.once('error', error => {
-      if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
-        rememberLog(`Ignoring stale Hermes backend error: ${error.message}`)
-        rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
-
-        return
+    })().catch(error => {
+      if (!backendConnectionState.clearPromiseForAttempt(connectionAttempt)) {
+        throw error
       }
 
-      rememberLog(`Hermes backend failed to start: ${error.message}`)
+      const message = error instanceof Error ? error.message : String(error)
+
+      // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
+      // timeout / host briefly unreachable across sleep) is transient and has no
+      // child 'exit' handler to clear the cache — latching it would wedge the app
+      // on "session expired" until a full restart.
+      if (shouldLatchBackendStartFailure({ attemptedRemote })) {
+        backendStartFailure = error instanceof Error ? error : new Error(message)
+      }
+
       updateBootProgress(
         {
-          error: error.message,
-          message: `Hermes backend failed to start: ${error.message}`,
+          error: message,
+          message: `Desktop boot failed: ${message}`,
           phase: 'backend.error',
           running: false
         },
         { allowDecrease: true }
       )
-      sendBackendExit({ code: null, signal: null, error: error.message })
-      rejectBackendStart?.(error)
-    })
-    hermesProcess.once('exit', (code, signal) => {
-      if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
-        rememberLog(`Ignoring stale Hermes backend exit (${signal || code})`)
-
-        if (!backendReady) {
-          rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
-        }
-
-        return
-      }
-
-      rememberLog(`Hermes backend exited (${signal || code})`)
-      sendBackendExit({ code, signal })
-
-      if (!backendReady) {
-        const message = `Hermes backend exited before it became ready (${signal || code}).`
-        updateBootProgress(
-          {
-            error: message,
-            message,
-            phase: 'backend.error',
-            running: false
-          },
-          { allowDecrease: true }
-        )
-        rejectBackendStart?.(
-          new Error(
-            `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
-          )
-        )
-      }
-    })
-
-    await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
-
-    // Discover the ephemeral port the child bound to
-    const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
-      backendStartFailed
-    ])
-
-    if (readyFile) {
-      fs.unlink(readyFile, () => {})
-    }
-
-    const baseUrl = `http://127.0.0.1:${port}`
-    await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
-    await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
-    backendReady = true
-    backendStartFailure = null
-
-    const authToken = await adoptServedDashboardToken(baseUrl, token, {
-      childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
-      rememberLog
-    })
-
-    updateBootProgress({
-      phase: 'backend.ready',
-      message: 'Hermes backend is ready. Finalizing desktop startup',
-      progress: 94,
-      running: true,
-      error: null
-    })
-
-    return {
-      baseUrl,
-      mode: 'local',
-      source: 'local',
-      authMode: 'token',
-      token: authToken,
-      wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
-      logs: hermesLog.slice(-80),
-      ...getWindowState()
-    }
-  })().catch(error => {
-    if (!backendConnectionState.clearPromiseForAttempt(connectionAttempt)) {
+      primaryConnectionMode = null
       throw error
-    }
+    })
+  }
 
-    const message = error instanceof Error ? error.message : String(error)
-
-    // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
-    // timeout / host briefly unreachable across sleep) is transient and has no
-    // child 'exit' handler to clear the cache — latching it would wedge the app
-    // on "session expired" until a full restart, defeating reconnect, the
-    // "Sign out & sign in" reload, and the wake-recovery revalidate path.
-    if (shouldLatchBackendStartFailure({ attemptedRemote })) {
-      backendStartFailure = error instanceof Error ? error : new Error(message)
-    }
-
-    updateBootProgress(
-      {
-        error: message,
-        message: `Desktop boot failed: ${message}`,
-        phase: 'backend.error',
-        running: false
-      },
-      { allowDecrease: true }
-    )
-    throw error
-  })
+  const connectionPromise = activeLease
+    ? runPrimaryStartup(activeLease)
+    : gracefulDesktopRelaunch.runOperation('primary backend startup', runPrimaryStartup)
 
   backendConnectionState.setPromise(connectionAttempt, connectionPromise)
 
@@ -7425,9 +7793,8 @@ ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(pro
 // to confirm the cached PRIMARY backend is still reachable; if a remote one is
 // not, we drop the cache so the next getConnection() rebuilds it. Local backends
 // self-heal via their child 'exit' handler, so we never touch them here.
-ipcMain.handle('hermes:connection:revalidate', async () => {
+async function revalidateDesktopConnection(activeLease: () => void) {
   const connectionPromise = backendConnectionState.getPromise()
-
   if (!connectionPromise) {
     return { ok: true, rebuilt: false }
   }
@@ -7436,6 +7803,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
   try {
     conn = await connectionPromise
+    activeLease()
   } catch {
     // The cached boot already rejected (its own catch clears the promise);
     // nothing to revalidate — the next getConnection() builds fresh.
@@ -7461,7 +7829,10 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
     return { ok: true, rebuilt: true }
   }
-})
+}
+ipcMain.handle('hermes:connection:revalidate', async () =>
+  gracefulDesktopRelaunch.runOperation('connection revalidate', revalidateDesktopConnection)
+)
 ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 
@@ -7625,7 +7996,7 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 
   mainWindow.webContents.send('hermes:pet-overlay:control', payload)
 })
-ipcMain.handle('hermes:bootstrap:reset', async () => {
+async function resetDesktopBootstrap() {
   // Renderer's "Reload and retry" path. Clear the latched failure and
   // reset connection state so the next startHermes() call restarts the
   // full backend flow (including a fresh runBootstrap pass).
@@ -7645,8 +8016,11 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   }
 
   return { ok: true }
-})
-ipcMain.handle('hermes:bootstrap:repair', async () => {
+}
+ipcMain.handle('hermes:bootstrap:reset', async () =>
+  gracefulDesktopRelaunch.runOperation('bootstrap reset', resetDesktopBootstrap)
+)
+async function repairDesktopBootstrap() {
   // Forceful repair: drop the bootstrap-complete marker so the next
   // startHermes() re-runs the full installer (refreshing a broken/partial
   // venv), and clear any latched failure + live connection. The renderer
@@ -7663,10 +8037,13 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
 
   bootstrapFailure = null
   backendStartFailure = null
-  resetHermesConnection()
+  await teardownPrimaryBackendAndWait()
 
   return { ok: true }
-})
+}
+ipcMain.handle('hermes:bootstrap:repair', async () =>
+  gracefulDesktopRelaunch.runOperation('bootstrap repair', repairDesktopBootstrap)
+)
 ipcMain.handle('hermes:bootstrap:cancel', async () => {
   // Renderer's Cancel button during first-launch install. Abort the running
   // install script (SIGTERM via the runner's abortSignal). runBootstrap
@@ -7744,7 +8121,7 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
-ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+async function applyDesktopConnectionConfig(payload) {
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
 
@@ -7754,7 +8131,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     // Editing a NON-primary profile's connection: don't disturb the window's
     // primary backend. Drop the profile's pooled backend so the next switch
     // re-resolves against the new remote/local target.
-    stopPoolBackend(key)
+    await teardownPoolBackendAndWait(key)
   } else {
     // Global / primary connection: soft re-home. Tear down the window backend
     // without resetting boot UI or reloading — the shell stays, the renderer
@@ -7764,10 +8141,25 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   }
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
-})
+}
+ipcMain.handle('hermes:connection-config:apply', async (_event, payload) =>
+  gracefulDesktopRelaunch.runOperation('connection apply', () => applyDesktopConnectionConfig(payload))
+)
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
-ipcMain.handle('hermes:profile:set', async (_event, name) => {
+ipcMain.handle('hermes:pinnedSessions:get', async () => {
+  ensurePinnedSessionsWatcher()
+
+  return readDesktopPinnedSessions()
+})
+ipcMain.handle('hermes:pinnedSessions:set', async (_event, ids) => {
+  ensurePinnedSessionsWatcher()
+  const result = writeDesktopPinnedSessions(ids)
+  broadcastPinnedSessionsChanged()
+
+  return result
+})
+async function setDesktopProfile(name) {
   const next = writeActiveDesktopProfile(name)
 
   // Switching profiles is a backend re-home: relaunch the dashboard under the
@@ -7777,7 +8169,10 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   mainWindow?.reload()
 
   return { profile: next }
-})
+}
+ipcMain.handle('hermes:profile:set', async (_event, name) =>
+  gracefulDesktopRelaunch.runOperation('profile switch', () => setDesktopProfile(name))
+)
 
 ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
   previewShortcutActive = Boolean(active)
@@ -7948,7 +8343,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+async function handleHermesApiRequest(request, activeLease: (() => void) | null = null) {
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
@@ -7967,7 +8362,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
   const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
+  const connection = await ensureBackend(routeProfile, activeLease)
+  activeLease?.()
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
@@ -8001,6 +8397,15 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     upload: request?.upload,
     timeoutMs
   })
+}
+ipcMain.handle('hermes:api', async (_event, request) => {
+  if (profileNameFromDeleteRequest(request)) {
+    return gracefulDesktopRelaunch.runOperation('profile delete', assertActive =>
+      handleHermesApiRequest(request, assertActive)
+    )
+  }
+
+  return handleHermesApiRequest(request)
 })
 
 ipcMain.handle('hermes:notify', (_event, payload) => {
@@ -8661,7 +9066,7 @@ ipcMain.handle('hermes:git:scanRepos', async (_event, roots, options) => {
   }
 })
 
-ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
+async function startDesktopTerminal(event, payload: any = {}) {
   const id = crypto.randomUUID()
   const { args, command, name } = terminalShellCommand()
   const cwd = safeTerminalCwd(payload?.cwd)
@@ -8694,7 +9099,10 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   event.sender.once('destroyed', () => disposeTerminalSession(id))
 
   return { cwd, id, shell: name }
-})
+}
+ipcMain.handle('hermes:terminal:start', async (event, payload = {}) =>
+  gracefulDesktopRelaunch.runOperation('terminal start', () => startDesktopTerminal(event, payload))
+)
 
 ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
   const sessionInfo = terminalSessions.get(String(id || ''))
@@ -8901,6 +9309,30 @@ async function getUninstallSummary() {
 }
 
 async function runDesktopUninstall(mode) {
+  try {
+    return await gracefulDesktopRelaunch.runOperation('uninstall', () => runDesktopUninstallWithHandoffGuard(mode))
+  } catch (error) {
+    return { ok: false, error: 'relaunch-active', message: error.message }
+  }
+}
+
+async function runDesktopUninstallWithHandoffGuard(mode) {
+  if (uninstallInFlight || isQuittingForHandoff) {
+    return { ok: false, error: 'handoff-active', message: 'A desktop handoff is already in progress.' }
+  }
+
+  uninstallInFlight = true
+
+  try {
+    return await runDesktopUninstallImpl(mode)
+  } finally {
+    if (!isQuittingForHandoff) {
+      uninstallInFlight = false
+    }
+  }
+}
+
+async function runDesktopUninstallImpl(mode) {
   let uninstallArgs
 
   try {
@@ -9211,7 +9643,14 @@ function configureSpellChecker() {
   }
 }
 
-app.on('before-quit', () => {
+app.on('before-quit', event => {
+  if (gracefulDesktopRelaunch.draining) {
+    event.preventDefault()
+    rememberLog('[relaunch] ignored competing quit while owned backends are draining')
+
+    return
+  }
+
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -9233,14 +9672,20 @@ app.on('before-quit', () => {
   flushDesktopLogBufferSync()
   closePreviewWatchers()
 
-  // Kill open PTYs before environment teardown to avoid the node-pty#904
-  // ThreadSafeFunction SIGABRT race.
-  for (const id of [...terminalSessions.keys()]) {
-    disposeTerminalSession(id)
-  }
+  // A successful graceful relaunch already proved there are no PTYs and waited
+  // for every owned backend to exit naturally. Do not re-enter force cleanup
+  // from before-quit; all other quit/update/uninstall paths keep the established
+  // teardown behavior.
+  if (!gracefulDesktopRelaunch.active) {
+    // Kill open PTYs before environment teardown to avoid the node-pty#904
+    // ThreadSafeFunction SIGABRT race.
+    for (const id of [...terminalSessions.keys()]) {
+      disposeTerminalSession(id)
+    }
 
-  stopBackendChild(backendConnectionState.getProcess())
-  stopAllPoolBackends()
+    stopBackendChild(backendConnectionState.getProcess())
+    stopAllPoolBackends()
+  }
 })
 
 app.on('window-all-closed', () => {
