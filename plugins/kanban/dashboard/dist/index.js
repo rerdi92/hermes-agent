@@ -981,8 +981,21 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       }).then(function (res) {
-        loadBoardList();
-        return res;
+        // Merge the authoritative PATCH response immediately, then keep the
+        // settings dialog open until the full list refresh settles. This keeps
+        // a just-saved default_workdir authoritative for the next create dialog
+        // even when GET /boards is delayed or fails non-fatally.
+        const savedBoard = res && res.board;
+        if (savedBoard) {
+          setBoardList(function (previous) {
+            const found = previous.some(function (item) { return item.slug === slug; });
+            if (!found) return previous.concat([savedBoard]);
+            return previous.map(function (item) {
+              return item.slug === slug ? Object.assign({}, item, savedBoard) : item;
+            });
+          });
+        }
+        return loadBoardList().then(function () { return res; });
       });
     }, [loadBoardList]);
 
@@ -2086,8 +2099,9 @@
       // Send default_workdir unconditionally: "" clears it on the server,
       // a path sets it (validated server-side: absolute + existing dir).
       props.onSave({
-        name: name.trim() || undefined,
-        description: description.trim() || undefined,
+        // Empty strings are meaningful: they clear/reset existing metadata.
+        name: name.trim(),
+        description: description.trim(),
         default_workdir: projectDirectory.trim(),
       }).catch(function (e) {
         setErr(parseApiErrorMessage(e));
@@ -2919,6 +2933,26 @@
     const defaultWorkspacePath = props.defaultWorkspacePath || "";
     const [workspaceKind, setWorkspaceKind] = useState(defaultWorkspaceKind);
     const [workspacePath, setWorkspacePath] = useState(defaultWorkspacePath);
+    const previousDefaultWorkspaceKindRef = useRef(defaultWorkspaceKind);
+    const previousDefaultWorkspacePathRef = useRef(defaultWorkspacePath);
+
+    // A board-settings refresh may arrive while this modal is mounted. Adopt
+    // new defaults only while the field still equals the previous default;
+    // explicit user edits always win.
+    useEffect(function () {
+      const previous = previousDefaultWorkspaceKindRef.current;
+      setWorkspaceKind(function (current) {
+        return current === previous ? defaultWorkspaceKind : current;
+      });
+      previousDefaultWorkspaceKindRef.current = defaultWorkspaceKind;
+    }, [defaultWorkspaceKind]);
+    useEffect(function () {
+      const previous = previousDefaultWorkspacePathRef.current;
+      setWorkspacePath(function (current) {
+        return current === previous ? defaultWorkspacePath : current;
+      });
+      previousDefaultWorkspacePathRef.current = defaultWorkspacePath;
+    }, [defaultWorkspacePath]);
     // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
     // loop — a judge re-checks the card after each turn and the worker keeps
     // going in the same session until done, or the turn budget runs out

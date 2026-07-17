@@ -315,7 +315,7 @@
 
 /* Wider than the base dialog so the workspace/parent selectors and the
    labeled two-column rows breathe; still clamped to the viewport. */
-.hermes-kanban-create-dialog {
+.hermes-kanban-dialog.hermes-kanban-create-dialog {
   width: 36rem;
 }
 

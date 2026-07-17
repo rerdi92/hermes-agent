@@ -2545,3 +2545,46 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+def test_dashboard_board_settings_waits_for_refresh_and_merges_saved_metadata():
+    """Closing settings must wait for refreshed defaults, with PATCH data merged eagerly."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    update = dist[dist.index("const updateBoard ="):dist.index("const deleteBoard =")]
+
+    assert "setBoardList(function (previous)" in update
+    assert "Object.assign({}, item, savedBoard)" in update
+    assert "return loadBoardList().then(function ()" in update
+
+
+def test_dashboard_create_dialog_resyncs_only_unedited_workspace_defaults():
+    """A delayed board refresh updates pristine create defaults without clobbering edits."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    create = dist[dist.index("function InlineCreate"):]
+
+    assert "previousDefaultWorkspaceKindRef" in create
+    assert "current === previous ? defaultWorkspaceKind : current" in create
+    assert "previousDefaultWorkspacePathRef" in create
+    assert "current === previous ? defaultWorkspacePath : current" in create
+
+
+def test_dashboard_board_settings_can_clear_name_and_description():
+    """Empty metadata fields must be serialized as empty strings, not omitted."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    settings = dist[
+        dist.index("function BoardSettingsDialog"):dist.index("function InlineCreate")
+    ]
+
+    assert "name: name.trim()," in settings
+    assert "description: description.trim()," in settings
+
+
+def test_dashboard_create_dialog_width_rule_has_higher_specificity():
+    """The intended 36rem create width must beat the later 28rem base dialog rule."""
+    repo_root = Path(__file__).resolve().parents[2]
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert ".hermes-kanban-dialog.hermes-kanban-create-dialog {\n  width: 36rem;" in css
