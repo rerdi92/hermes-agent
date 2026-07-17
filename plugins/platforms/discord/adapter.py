@@ -5738,6 +5738,10 @@ class DiscordAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        multi_select: bool = False,
+        min_selections: int = 0,
+        max_selections: Optional[int] = None,
+        allow_other: bool = True,
     ) -> SendResult:
         """Render a clarify prompt with one Discord button per choice.
 
@@ -5814,22 +5818,49 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = [
                 s for s in (_flatten_choice(c) for c in (choices or [])) if s
             ]
-            # Discord allows up to 5 buttons per row, 5 rows per view = 25.
-            # We reserve one slot for the "Other" button, so cap at 24 choices.
+            # Discord caps a select menu at 25 options and a button view at 25
+            # components. Keep one slot available for the single-select Other
+            # button; the same 24-choice cap gives both clarify modes one stable
+            # canonical choice list.
             clean_choices = clean_choices[:24]
 
             if clean_choices:
-                embed.add_field(
-                    name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
-                    inline=False,
-                )
-                view = ClarifyChoiceView(
-                    choices=clean_choices,
-                    clarify_id=clarify_id,
-                    allowed_user_ids=self._allowed_user_ids,
-                    allowed_role_ids=self._allowed_role_ids,
-                )
+                if multi_select:
+                    help_text = "Pick one or more below, then submit selected"
+                    if allow_other:
+                        help_text += ", or click ✏️ Other to type a custom answer"
+                    help_text += "."
+                    embed.add_field(
+                        name="Choices",
+                        value=help_text,
+                        inline=False,
+                    )
+                    view = ClarifyMultiSelectView(
+                        choices=clean_choices,
+                        clarify_id=clarify_id,
+                        allowed_user_ids=self._allowed_user_ids,
+                        allowed_role_ids=self._allowed_role_ids,
+                        min_selections=min_selections,
+                        max_selections=max_selections,
+                        allow_other=allow_other,
+                    )
+                else:
+                    help_text = "Pick one below"
+                    if allow_other:
+                        help_text += ", or click ✏️ Other to type a custom answer"
+                    help_text += "."
+                    embed.add_field(
+                        name="Choices",
+                        value=help_text,
+                        inline=False,
+                    )
+                    view = ClarifyChoiceView(
+                        choices=clean_choices,
+                        clarify_id=clarify_id,
+                        allowed_user_ids=self._allowed_user_ids,
+                        allowed_role_ids=self._allowed_role_ids,
+                        allow_other=allow_other,
+                    )
             else:
                 embed.add_field(
                     name="Reply",
@@ -5841,7 +5872,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Mirror the question in plain content — embeds are invisible on
             # some clients (see send_exec_approval).
             clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
+                f"\n\n{help_text}"
                 if clean_choices
                 else "\n\nReply in this channel with your answer."
             )
@@ -6898,7 +6929,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, ClarifyMultiSelectView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -7686,6 +7717,294 @@ def _define_discord_view_classes() -> None:
                 except Exception:
                     pass
 
+
+    class ClarifyMultiSelectView(discord.ui.View):
+        """Native Discord multi-select clarify view.
+
+        Choices are staged in a select menu and resolved exactly once only when
+        the user submits. Bounds are enforced both by Discord's component and by
+        the callback; ``Other`` switches to constrained typed-response handling.
+        """
+
+        def __init__(
+            self,
+            choices: List[str],
+            clarify_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+            min_selections: int = 0,
+            max_selections: Optional[int] = None,
+            allow_other: bool = True,
+        ):
+            super().__init__(timeout=_read_discord_prompt_timeout())
+            self.choices = list(choices)[:24]
+            self.clarify_id = clarify_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+
+            choice_count = len(self.choices)
+            try:
+                requested_min = int(min_selections or 0)
+            except (TypeError, ValueError):
+                requested_min = 0
+            try:
+                requested_max = (
+                    choice_count if max_selections is None else int(max_selections)
+                )
+            except (TypeError, ValueError):
+                requested_max = choice_count
+            self.min_selections = max(0, min(requested_min, choice_count))
+            self.max_selections = max(
+                self.min_selections,
+                min(max(0, requested_max), choice_count),
+            )
+            self.allow_other = bool(allow_other)
+            self.selected_indices: set[int] = set()
+            self.resolved = False
+
+            options = [
+                discord.SelectOption(
+                    label=_truncate_discord_component_text(
+                        str(choice), _DISCORD_SELECT_FIELD_LIMIT
+                    ),
+                    value=str(index),
+                )
+                for index, choice in enumerate(self.choices)
+            ]
+            select = discord.ui.Select(
+                placeholder="Select one or more choices…",
+                options=options,
+                custom_id=f"clarify:{clarify_id}:multi",
+                min_values=max(1, self.min_selections) if self.choices else 0,
+                max_values=max(1, self.max_selections) if self.choices else 1,
+            )
+            select.callback = self._on_select
+            self.add_item(select)
+
+            submit_btn = discord.ui.Button(
+                label="✅ Submit selected",
+                style=discord.ButtonStyle.success,
+                custom_id=f"clarify:{clarify_id}:multi_submit",
+            )
+            submit_btn.callback = self._on_submit
+            self.add_item(submit_btn)
+
+            if self.allow_other:
+                other_btn = discord.ui.Button(
+                    label="✏️ Other (type answer)",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"clarify:{clarify_id}:other",
+                )
+                other_btn.callback = self._on_other
+                self.add_item(other_btn)
+
+        def _check_auth(self, interaction: "discord.Interaction") -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        async def _on_select(self, interaction: "discord.Interaction") -> None:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This prompt has already been answered~", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this prompt~", ephemeral=True,
+                )
+                return
+
+            values = getattr(interaction, "data", {}).get("values", [])
+            selected: set[int] = set()
+            for value in values:
+                try:
+                    idx = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(self.choices):
+                    selected.add(idx)
+            if len(selected) > self.max_selections:
+                await interaction.response.send_message(
+                    f"Select at most {self.max_selections} choices~",
+                    ephemeral=True,
+                )
+                return
+            self.selected_indices = selected
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                selected_text = (
+                    ", ".join(self.choices[i] for i in sorted(selected))
+                    or "none yet"
+                )
+                embed.set_footer(text=f"Selected: {selected_text}")
+            await interaction.response.edit_message(embed=embed, view=self)
+
+        async def _on_submit(self, interaction: "discord.Interaction") -> None:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This prompt has already been answered~", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this prompt~", ephemeral=True,
+                )
+                return
+
+            selection_count = len(self.selected_indices)
+            if selection_count < self.min_selections:
+                await interaction.response.send_message(
+                    f"Select at least {self.min_selections} choices~",
+                    ephemeral=True,
+                )
+                return
+            if selection_count > self.max_selections:
+                await interaction.response.send_message(
+                    f"Select at most {self.max_selections} choices~",
+                    ephemeral=True,
+                )
+                return
+
+            resolved_text = ", ".join(
+                self.choices[i]
+                for i in sorted(self.selected_indices)
+                if 0 <= i < len(self.choices)
+            )
+            # Latch before invoking the resolver or awaiting Discord so racing
+            # submit/Other callbacks cannot resolve the same prompt twice.
+            self.resolved = True
+            stop_view = getattr(self, "stop", None)
+            if callable(stop_view):
+                stop_view()
+            for child in self.children:
+                child.disabled = True
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                user = getattr(interaction, "user", None)
+                display_name = getattr(user, "display_name", "user")
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Answered by {display_name}: {resolved_text}")
+
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+
+                resolved = resolve_gateway_clarify(self.clarify_id, resolved_text)
+                logger.info(
+                    "Discord clarify multi-select resolved "
+                    "(id=%s, choices=%r, ok=%s)",
+                    self.clarify_id,
+                    resolved_text,
+                    resolved,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Discord clarify multi-select resolve failed (id=%s): %s",
+                    self.clarify_id,
+                    exc,
+                )
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                logger.debug(
+                    "Discord clarify multi-select edit_message failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+
+        async def _on_other(self, interaction: "discord.Interaction") -> None:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This prompt has already been answered~", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this prompt~", ephemeral=True,
+                )
+                return
+            if not self.allow_other:
+                await interaction.response.send_message(
+                    "A custom answer is not allowed for this prompt~",
+                    ephemeral=True,
+                )
+                return
+
+            # Latch before touching the shared clarify registry so a racing
+            # submit callback cannot also resolve this prompt.
+            self.resolved = True
+            stop_view = getattr(self, "stop", None)
+            if callable(stop_view):
+                stop_view()
+            for child in self.children:
+                child.disabled = True
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                marked = mark_awaiting_text(self.clarify_id)
+                logger.info(
+                    "Discord clarify multi-select awaiting typed response "
+                    "(id=%s, ok=%s)",
+                    self.clarify_id,
+                    marked,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Discord clarify multi-select mark_awaiting_text failed "
+                    "(id=%s): %s",
+                    self.clarify_id,
+                    exc,
+                )
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                user = getattr(interaction, "user", None)
+                display_name = getattr(user, "display_name", "user")
+                embed.color = discord.Color.blue()
+                embed.set_footer(
+                    text=f"Awaiting typed response from {display_name}…"
+                )
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+
+        async def on_timeout(self):
+            if self.resolved:
+                return
+            self.resolved = True
+            stop_view = getattr(self, "stop", None)
+            if callable(stop_view):
+                stop_view()
+            for child in self.children:
+                child.disabled = True
+            msg = getattr(self, "_message", None)
+            if msg:
+                try:
+                    embed = msg.embeds[0] if msg.embeds else None
+                    if embed:
+                        embed.color = discord.Color.greyple()
+                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                    await msg.edit(embed=embed, view=self)
+                except Exception:
+                    pass
+
+
     class ClarifyChoiceView(discord.ui.View):
         """Interactive button view for the clarify tool's multiple-choice prompts.
 
@@ -7707,12 +8026,14 @@ def _define_discord_view_classes() -> None:
             clarify_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            allow_other: bool = True,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.allow_other = bool(allow_other)
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
@@ -7766,13 +8087,14 @@ def _define_discord_view_classes() -> None:
                 button.callback = self._make_choice_callback(index, choice)
                 self.add_item(button)
 
-            other_btn = discord.ui.Button(
-                label="✏️ Other (type answer)",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"clarify:{clarify_id}:other",
-            )
-            other_btn.callback = self._on_other
-            self.add_item(other_btn)
+            if self.allow_other:
+                other_btn = discord.ui.Button(
+                    label="✏️ Other (type answer)",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"clarify:{clarify_id}:other",
+                )
+                other_btn.callback = self._on_other
+                self.add_item(other_btn)
 
         def _check_auth(self, interaction: "discord.Interaction") -> bool:
             return _component_check_auth(

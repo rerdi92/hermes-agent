@@ -65,6 +65,16 @@ _hermes_interactive_ctx: contextvars.ContextVar[Optional[str]] = contextvars.Con
     default=None,
 )
 
+# ACP editors expose a direct request_permission callback that represents the
+# human owner's decision. Smart Approval remains useful as an advisory risk
+# signal, but must never return APPROVE before that editor callback is asked.
+# Keep this context-local so concurrent ACP sessions cannot affect ordinary
+# CLI/gateway turns or each other.
+_acp_approval_authority_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "acp_approval_authority",
+    default=False,
+)
+
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context (thread or asyncio task).
@@ -79,6 +89,16 @@ def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
 def reset_hermes_interactive_context(token: contextvars.Token) -> None:
     """Restore the prior value from :func:`set_hermes_interactive_context`."""
     _hermes_interactive_ctx.reset(token)
+
+
+def set_acp_approval_authority_context(authoritative: bool) -> contextvars.Token:
+    """Bind whether ACP's human permission callback is authoritative here."""
+    return _acp_approval_authority_ctx.set(bool(authoritative))
+
+
+def reset_acp_approval_authority_context(token: contextvars.Token) -> None:
+    """Restore the prior ACP human-approval authority value."""
+    _acp_approval_authority_ctx.reset(token)
 
 
 def _is_interactive_cli() -> bool:
@@ -2703,6 +2723,19 @@ def _run_approval_gate(
         except Exception:
             approval_callback = None
 
+    acp_human_authority = _acp_approval_authority_ctx.get()
+    if acp_human_authority and approval_callback is None:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: ACP owner approval is required, but no permission "
+                "callback is available. Silence is not consent."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "user_consent": False,
+        }
+
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
 
@@ -2744,7 +2777,9 @@ def _run_approval_gate(
         )
         return {"approved": True, "message": None}
 
-    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+    if (
+        is_gateway or env_var_enabled("HERMES_EXEC_ASK")
+    ) and not acp_human_authority:
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -2830,6 +2865,15 @@ def _run_approval_gate(
 
     choice = prompt_dangerous_approval(display_target, description,
                                        approval_callback=approval_callback)
+
+    if acp_human_authority and (
+        not isinstance(choice, str)
+        or choice not in {"once", "session", "always", "deny"}
+    ):
+        logger.warning(
+            "ACP owner approval callback returned an invalid choice; denying"
+        )
+        choice = "deny"
 
     if choice == "deny":
         return {
@@ -3378,6 +3422,23 @@ def check_all_command_guards(command: str, env_type: str,
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     smart_denied_for_owner = False
+    acp_human_authority = _acp_approval_authority_ctx.get()
+    if acp_human_authority and approval_callback is None:
+        logger.error(
+            "ACP human approval authority is active but no approval callback "
+            "is registered; denying command"
+        )
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: ACP requires an explicit human approval callback, "
+                "but none is available."
+            ),
+            "pattern_key": warnings[0][0],
+            "description": "; ".join(desc for _, desc, _ in warnings),
+            "outcome": "denied",
+            "user_consent": False,
+        }
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
@@ -3392,12 +3453,20 @@ def check_all_command_guards(command: str, env_type: str,
         if verdict == "approve":
             # Approve this command only. Pattern-level persistence would let one
             # benign command suppress review of later commands that happen to
-            # match the same broad detector category.
-            logger.debug("Smart approval: auto-approved '%s' (%s)",
-                         command[:60], combined_desc_for_llm)
-            return {"approved": True, "message": None,
-                    "smart_approved": True,
-                    "description": combined_desc_for_llm}
+            # match the same broad detector category. ACP is different: its
+            # editor callback is the human authority, so the auxiliary verdict
+            # is advisory and cannot return before that callback.
+            if not acp_human_authority:
+                logger.debug("Smart approval: auto-approved '%s' (%s)",
+                             command[:60], combined_desc_for_llm)
+                return {"approved": True, "message": None,
+                        "smart_approved": True,
+                        "description": combined_desc_for_llm}
+            logger.debug(
+                "Smart approval recommended APPROVE for ACP command '%s'; "
+                "continuing to authoritative human callback",
+                command[:60],
+            )
         elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
             return {
                 "approved": False,
@@ -3422,7 +3491,7 @@ def check_all_command_guards(command: str, env_type: str,
     # responds with /approve or /deny, mirroring the CLI's synchronous
     # input() flow.  The agent never sees "approval_required"; it either
     # gets the command output (approved) or a definitive "BLOCKED" message.
-    if is_gateway or is_ask:
+    if (is_gateway or is_ask) and not acp_human_authority:
         notify_cb = None
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
@@ -3567,6 +3636,12 @@ def check_all_command_guards(command: str, env_type: str,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
+    if acp_human_authority and (
+        not isinstance(choice, str)
+        or choice not in {"once", "session", "always", "deny"}
+    ):
+        logger.error("ACP approval callback returned invalid choice %r; denying", choice)
+        choice = "deny"
     _fire_approval_hook(
         "post_approval_response",
         command=command,
