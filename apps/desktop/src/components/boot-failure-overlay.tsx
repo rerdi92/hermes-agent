@@ -191,6 +191,15 @@ export function BootFailureOverlay() {
 
   const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
   const copy = t.boot.failure
+  const connectionLost = !remoteReauth && boot.failureKind === 'connection-lost'
+
+  const title = remoteReauth ? copy.remoteTitle : connectionLost ? copy.connectionLostTitle : copy.title
+
+  const description = remoteReauth
+    ? copy.remoteDescription
+    : connectionLost
+      ? copy.connectionLostDescription
+      : copy.description
 
   const label = signInLabel(remoteReauth, {
     identityProvider: copy.identityProvider,
@@ -200,9 +209,9 @@ export function BootFailureOverlay() {
 
   // Recovery actions are shaped by the failure kind so the leading (primary)
   // button is the one that actually fixes it: Sign in for a lapsed remote
-  // session, Connection settings for any other remote failure (local Retry /
-  // Repair can't revive a dead remote — Repair is dropped there), Retry for a
-  // local backend. Open logs is always appended.
+  // session, Retry for an interrupted live connection, Connection settings for
+  // any other remote failure (local Retry / Repair can't revive a dead remote),
+  // Retry + Repair for a local startup failure. Open logs is always appended.
   type RecoveryVariant = ComponentProps<typeof Button>['variant']
   interface RecoveryAction {
     key: string
@@ -252,6 +261,12 @@ export function BootFailureOverlay() {
       localAction
     ]
     hint = copy.remoteSignInHint(label)
+  } else if (connectionLost) {
+    // A post-boot disconnect is not an install failure. Keep the normal action
+    // list (including settings and the local fallback), but never suggest the
+    // installer repair that is reserved for a local startup failure.
+    actions = [retryAction, { ...settingsAction, variant: 'secondary' }, localAction]
+    hint = copy.connectionLostHint
   } else if (remoteFailure) {
     actions = [settingsAction, { ...retryAction, variant: 'secondary' }, localAction]
     hint = copy.remoteFailureHint
@@ -304,10 +319,10 @@ export function BootFailureOverlay() {
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
             <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {remoteReauth ? copy.remoteTitle : copy.title}
+              {title}
             </h2>
             <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {remoteReauth ? copy.remoteDescription : copy.description}
+              {description}
             </p>
           </div>
         </div>

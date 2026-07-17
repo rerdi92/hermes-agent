@@ -110,6 +110,7 @@ export function getVenvSitePackagesEntries(
   }
 
   const isWindows = opts.isWindows ?? process.platform === 'win32'
+  const platformPath = isWindows ? path.win32 : path.posix
 
   const directoryExists =
     opts.directoryExists ??
@@ -132,7 +133,7 @@ export function getVenvSitePackagesEntries(
     })
 
   if (isWindows) {
-    const sitePackages = path.join(venvRoot, 'Lib', 'site-packages')
+    const sitePackages = platformPath.join(venvRoot, 'Lib', 'site-packages')
 
     if (directoryExists(sitePackages)) {
       entries.push(sitePackages)
@@ -141,7 +142,7 @@ export function getVenvSitePackagesEntries(
     return entries
   }
 
-  const cfg = readFile(path.join(venvRoot, 'pyvenv.cfg'))
+  const cfg = readFile(platformPath.join(venvRoot, 'pyvenv.cfg'))
 
   const version = (() => {
     if (!cfg) {
@@ -154,7 +155,7 @@ export function getVenvSitePackagesEntries(
   })()
 
   if (version) {
-    const sitePackages = path.join(venvRoot, 'lib', `python${version}`, 'site-packages')
+    const sitePackages = platformPath.join(venvRoot, 'lib', `python${version}`, 'site-packages')
 
     if (directoryExists(sitePackages)) {
       entries.push(sitePackages)

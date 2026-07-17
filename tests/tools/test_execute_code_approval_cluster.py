@@ -177,6 +177,107 @@ def test_guard_headless_local_approved(monkeypatch):
     assert A.check_execute_code_guard("import os", "local")["approved"] is True
 
 
+def _run_acp_execute_code_guard(monkeypatch, callback, *, mode="manual", smart=None):
+    from tools import terminal_tool as TT
+
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: mode)
+    if smart is not None:
+        monkeypatch.setattr(A, "_smart_approve", lambda *_args: smart)
+
+    TT.set_approval_callback(callback)
+    interactive = A.set_hermes_interactive_context(True)
+    authority = A.set_acp_approval_authority_context(True)
+    try:
+        return A.check_execute_code_guard(
+            "from pathlib import Path; Path('owned').write_text('x')", "local"
+        )
+    finally:
+        A.reset_acp_approval_authority_context(authority)
+        A.reset_hermes_interactive_context(interactive)
+        TT.set_approval_callback(None)
+
+
+def test_acp_execute_code_manual_owner_deny_is_authoritative(monkeypatch):
+    calls = []
+    result = _run_acp_execute_code_guard(
+        monkeypatch,
+        lambda *_a, **_k: calls.append(True) or "deny",
+    )
+
+    assert calls == [True]
+    assert result["approved"] is False
+    assert result["outcome"] == "denied"
+    assert result["user_consent"] is False
+
+
+def test_acp_execute_code_smart_approve_still_requires_owner(monkeypatch):
+    calls = []
+    result = _run_acp_execute_code_guard(
+        monkeypatch,
+        lambda *_a, **_k: calls.append(True) or "deny",
+        mode="smart",
+        smart="approve",
+    )
+
+    assert calls == [True]
+    assert result["approved"] is False
+    assert "smart_approved" not in result
+
+
+@pytest.mark.parametrize(
+    "callback",
+    [
+        None,
+        lambda *_a, **_k: None,
+        lambda *_a, **_k: "unexpected",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("callback failed")),
+    ],
+    ids=["missing", "none", "malformed", "raising"],
+)
+def test_acp_execute_code_missing_or_invalid_owner_response_denies(
+    monkeypatch, callback
+):
+    result = _run_acp_execute_code_guard(monkeypatch, callback)
+
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+
+
+def test_execute_code_entrypoint_stops_before_spawn_on_acp_deny(
+    monkeypatch, tmp_path
+):
+    import tools.code_execution_tool as CET
+    from tools import terminal_tool as TT
+
+    marker = tmp_path / "must-not-exist"
+    monkeypatch.setattr(CET, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(TT, "_get_env_config", lambda: {"env_type": "local"})
+    monkeypatch.setattr(TT, "_docker_has_host_access", lambda _config: False)
+
+    TT.set_approval_callback(lambda *_a, **_k: "deny")
+    interactive = A.set_hermes_interactive_context(True)
+    authority = A.set_acp_approval_authority_context(True)
+    try:
+        result = json.loads(
+            CET.execute_code(
+                f"from pathlib import Path; Path({str(marker)!r}).touch()"
+            )
+        )
+    finally:
+        A.reset_acp_approval_authority_context(authority)
+        A.reset_hermes_interactive_context(interactive)
+        TT.set_approval_callback(None)
+
+    assert result["status"] == "error"
+    assert result["tool_calls_made"] == 0
+    assert marker.exists() is False
+
+
 def test_guard_cron_deny_blocks(monkeypatch):
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")

@@ -1660,6 +1660,153 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    @staticmethod
+    def _bare_store(db):
+        import threading
+
+        store = object.__new__(SessionStore)
+        store._db = db
+        store._transcript_retry_lock = threading.Lock()
+        store._transcript_session_locks = {}
+        store._dirty_transcripts = {}
+        store._transcript_append_failures = {}
+        store._fts_rebuild_attempted = True
+        return store
+
+    def test_same_session_concurrent_appends_have_one_drain_owner(self):
+        """Two worker threads must never persist the same queue head twice."""
+        import threading
+
+        class FakeDb:
+            def __init__(self):
+                self.calls = []
+                self.persisted = []
+                self.call_lock = threading.Lock()
+                self.first_entered = threading.Event()
+                self.release_first = threading.Event()
+                self.concurrent_call = threading.Event()
+
+            def append_message(self, **kwargs):
+                content = kwargs["content"]
+                with self.call_lock:
+                    call_index = len(self.calls)
+                    self.calls.append(content)
+                if call_index == 0:
+                    self.first_entered.set()
+                    assert self.release_first.wait(timeout=2)
+                else:
+                    self.concurrent_call.set()
+                self.persisted.append(content)
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        first = threading.Thread(
+            target=store.append_to_transcript,
+            args=("s1", {"role": "user", "content": "first"}),
+        )
+        second = threading.Thread(
+            target=store.append_to_transcript,
+            args=("s1", {"role": "assistant", "content": "second"}),
+        )
+
+        first.start()
+        assert db.first_entered.wait(timeout=2)
+        second.start()
+        second_reached_db_while_first_blocked = db.concurrent_call.wait(timeout=0.2)
+        db.release_first.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert not second_reached_db_while_first_blocked
+        assert not first.is_alive() and not second.is_alive()
+        assert db.persisted == ["first", "second"]
+        assert "s1" not in store._dirty_transcripts
+
+    def test_rewrite_waits_for_inflight_append_before_replacing(self):
+        """A stale append already in flight cannot land after a rewrite."""
+        import threading
+
+        class FakeDb:
+            def __init__(self):
+                self.operations = []
+                self.append_entered = threading.Event()
+                self.release_append = threading.Event()
+                self.replaced = threading.Event()
+
+            def append_message(self, **kwargs):
+                self.append_entered.set()
+                assert self.release_append.wait(timeout=2)
+                self.operations.append(("append", kwargs["content"]))
+
+            def replace_messages(self, session_id, messages):
+                self.operations.append(("replace", messages[0]["content"]))
+                self.replaced.set()
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        append_thread = threading.Thread(
+            target=store.append_to_transcript,
+            args=("s1", {"role": "user", "content": "stale"}),
+        )
+        rewrite_thread = threading.Thread(
+            target=store.rewrite_transcript,
+            args=("s1", [{"role": "user", "content": "fresh"}]),
+        )
+
+        append_thread.start()
+        assert db.append_entered.wait(timeout=2)
+        rewrite_thread.start()
+        rewrite_ran_while_append_blocked = db.replaced.wait(timeout=0.2)
+        db.release_append.set()
+        append_thread.join(timeout=2)
+        rewrite_thread.join(timeout=2)
+
+        assert not rewrite_ran_while_append_blocked
+        assert db.operations == [("append", "stale"), ("replace", "fresh")]
+
+    def test_rewind_waits_for_inflight_append_before_truncating(self):
+        """A stale append already in flight cannot land after a rewind."""
+        import threading
+
+        class FakeDb:
+            def __init__(self):
+                self.operations = []
+                self.append_entered = threading.Event()
+                self.release_append = threading.Event()
+                self.rewound = threading.Event()
+
+            def append_message(self, **kwargs):
+                self.append_entered.set()
+                assert self.release_append.wait(timeout=2)
+                self.operations.append(("append", kwargs["content"]))
+
+            def list_recent_user_messages(self, session_id, limit=10):
+                return [{"id": 1, "content": "old"}]
+
+            def rewind_to_message(self, session_id, target_id):
+                self.operations.append(("rewind", target_id))
+                self.rewound.set()
+                return {"target_message": {"id": target_id, "content": "old"}}
+
+        db = FakeDb()
+        store = self._bare_store(db)
+        append_thread = threading.Thread(
+            target=store.append_to_transcript,
+            args=("s1", {"role": "user", "content": "stale"}),
+        )
+        rewind_thread = threading.Thread(target=store.rewind_session, args=("s1", 1))
+
+        append_thread.start()
+        assert db.append_entered.wait(timeout=2)
+        rewind_thread.start()
+        rewind_ran_while_append_blocked = db.rewound.wait(timeout=0.2)
+        db.release_append.set()
+        append_thread.join(timeout=2)
+        rewind_thread.join(timeout=2)
+
+        assert not rewind_ran_while_append_blocked
+        assert db.operations == [("append", "stale"), ("rewind", 1)]
+
     def test_transcript_append_rebuilds_fts_and_retries_dirty_rows_in_order(self):
         import threading
 
@@ -1774,6 +1921,12 @@ class TestGatewaySessionDbRecovery:
         assert SessionStore._is_fts_corruption_error(
             RuntimeError("no such table: messages_fts")
         )
+        assert SessionStore._is_fts_corruption_error(
+            RuntimeError("malformed database schema: messages_fts")
+        )
+        assert not SessionStore._is_fts_corruption_error(
+            RuntimeError("malformed database schema: unrelated_table")
+        )
         assert not SessionStore._is_fts_corruption_error(
             RuntimeError("shifts were applied")
         )
@@ -1809,7 +1962,10 @@ class TestGatewaySessionDbRecovery:
             store.append_to_transcript("s1", {"role": "user", "content": f"msg{i}"})
 
         pending = store._dirty_transcripts.get("s1", [])
-        assert len(pending) <= store._MAX_PENDING_PER_SESSION
+        assert len(pending) == store._MAX_PENDING_PER_SESSION
+        assert [message["content"] for message in pending] == [
+            f"msg{i}" for i in range(10, store._MAX_PENDING_PER_SESSION + 10)
+        ]
 
     def test_new_session_records_gateway_peer_fields(self, tmp_path):
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
