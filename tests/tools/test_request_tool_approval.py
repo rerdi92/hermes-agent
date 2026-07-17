@@ -58,6 +58,108 @@ class TestRequestToolApproval:
         assert "denied" in res["message"].lower()
         assert res["pattern_key"].startswith("plugin_rule:")
 
+    def test_acp_authority_without_tls_callback_denies(self, monkeypatch):
+        """ACP plugin approval never falls back to local input or consent."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            approval,
+            "prompt_dangerous_approval",
+            lambda *a, **k: pytest.fail("missing ACP callback must not prompt"),
+        )
+        token = approval.set_acp_approval_authority_context(True)
+        try:
+            res = request_tool_approval("terminal", "smtp send", rule_key="send")
+        finally:
+            approval.reset_acp_approval_authority_context(token)
+
+        assert res["approved"] is False
+        assert res["user_consent"] is False
+        assert "no permission callback" in res["message"].lower()
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [None, "unexpected", {"choice": "deny"}, []],
+        ids=["none", "string", "mapping", "list"],
+    )
+    def test_acp_authority_malformed_tls_callback_denies(
+        self, monkeypatch, malformed
+    ):
+        """Only the four documented string choices can authorize a plugin."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback",
+            lambda: (lambda *_a, **_k: malformed),
+        )
+        token = approval.set_acp_approval_authority_context(True)
+        try:
+            res = request_tool_approval("terminal", "smtp send", rule_key="send")
+        finally:
+            approval.reset_acp_approval_authority_context(token)
+
+        assert res["approved"] is False
+        assert "denied" in res["message"].lower()
+
+    def test_acp_authority_raising_tls_callback_denies(self, monkeypatch):
+        """Editor callback errors are explicit denials, never implicit consent."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+
+        def raising_callback(*_args, **_kwargs):
+            raise RuntimeError("editor disconnected")
+
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback",
+            lambda: raising_callback,
+        )
+        token = approval.set_acp_approval_authority_context(True)
+        try:
+            res = request_tool_approval("terminal", "smtp send", rule_key="send")
+        finally:
+            approval.reset_acp_approval_authority_context(token)
+
+        assert res["approved"] is False
+        assert "denied" in res["message"].lower()
+
+    def test_acp_authority_valid_once_tls_callback_approves(self, monkeypatch):
+        """A valid owner choice still authorizes exactly one plugin operation."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback",
+            lambda: (lambda *_a, **_k: "once"),
+        )
+        token = approval.set_acp_approval_authority_context(True)
+        try:
+            res = request_tool_approval("terminal", "smtp send", rule_key="send")
+        finally:
+            approval.reset_acp_approval_authority_context(token)
+
+        assert res == {"approved": True, "message": None}
+
+    def test_acp_authority_tls_callback_beats_gateway_queue_flags(self, monkeypatch):
+        """ACP owner callback stays final even if gateway flags leaked in."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(
+            approval,
+            "submit_pending",
+            lambda *_a, **_k: pytest.fail("ACP authority must not queue"),
+        )
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback",
+            lambda: (lambda *_a, **_k: "deny"),
+        )
+        token = approval.set_acp_approval_authority_context(True)
+        try:
+            res = request_tool_approval("terminal", "smtp send", rule_key="send")
+        finally:
+            approval.reset_acp_approval_authority_context(token)
+
+        assert res["approved"] is False
+        assert "denied" in res["message"].lower()
+
     def test_cli_session_persists_session_only(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)

@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  restartDesktop: () => ipcRenderer.invoke('hermes:desktop:restart'),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
@@ -55,6 +56,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
+  },
+  pinnedSessions: {
+    get: () => ipcRenderer.invoke('hermes:pinnedSessions:get'),
+    set: ids => ipcRenderer.invoke('hermes:pinnedSessions:set', ids),
+    onChanged: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:pinnedSessions:changed', listener)
+      return () => ipcRenderer.removeListener('hermes:pinnedSessions:changed', listener)
+    }
   },
   api: request => ipcRenderer.invoke('hermes:api', request),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),

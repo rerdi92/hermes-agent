@@ -87,6 +87,9 @@ export const en: Translations = {
       remoteTitle: 'Remote gateway sign-in required',
       remoteDescription:
         'Your remote gateway session has expired. Sign in again to reconnect. Nothing here deletes your chats or settings.',
+      connectionLostTitle: 'Hermes connection was interrupted',
+      connectionLostDescription:
+        'Hermes started, but the desktop lost its live connection to the gateway. Retry reconnects without reinstalling; your chats and settings stay safe.',
       retry: 'Retry',
       repairInstall: 'Repair install',
       useLocalGateway: 'Use local gateway',
@@ -94,6 +97,8 @@ export const en: Translations = {
       back: 'Back',
       openLogs: 'Open logs',
       repairHint: 'Repair re-runs the installer and can take a few minutes on a fresh machine.',
+      connectionLostHint:
+        'Retry reconnects to the running gateway. Repair install is hidden because this is a connection interruption, not an install failure.',
       remoteSignInHint: signInLabel =>
         `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
       signOutAndSignIn: 'Sign out & sign in',
@@ -1106,6 +1111,7 @@ export const en: Translations = {
     gatewayRunning: 'Messaging gateway running',
     gatewayStopped: 'Messaging gateway stopped',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Active sessions ${count}`,
+    restartHermes: 'Restart Hermes',
     restartGateway: 'Restart gateway',
     gatewayRestartFailed: 'Gateway restart failed.',
     updateHermes: 'Update Hermes',
@@ -2167,6 +2173,12 @@ export const en: Translations = {
       openContextUsage: 'Open context usage breakdown',
       session: 'Session',
       runtimeSessionElapsed: 'Runtime session elapsed',
+      agentFleetOn: 'Agent Fleet on — prefixes sends with agent fleet mode. Click to turn off.',
+      agentFleetOff: 'Agent Fleet off — click to route sends through agent fleet mode.',
+      ultraworkOn: 'ULW on — prefixes sends with ultrawork mode. Click to turn off.',
+      ultraworkOff: 'ULW off — click to prefix sends with ultrawork mode.',
+      ultraresearchOn: 'ULR on — prefixes sends with ultraresearch mode. Click to turn off.',
+      ultraresearchOff: 'ULR off — click to prefix sends with ultraresearch mode.',
       yoloOn: 'YOLO on — auto-approving dangerous commands. Click to turn off. Shift+click toggles it globally.',
       yoloOff: 'YOLO off — click to auto-approve dangerous commands. Shift+click toggles it globally.',
       modelNone: 'none',
@@ -2411,11 +2423,21 @@ export const en: Translations = {
       notReady: 'Clarify request is not ready yet',
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send clarify response',
+      responsePendingTitle: 'Clarify response may still be processing',
+      responsePendingMessage:
+        'Hermes did not confirm the choice in time. The backend may still receive it, so wait a moment before trying again to avoid duplicate responses.',
+      responseExpiredTitle: 'Clarify request expired',
+      responseExpiredMessage:
+        'That choice request is no longer pending. Wait for Hermes to ask again, then answer the fresh prompt.',
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
       skip: 'Skip',
       skipped: 'Skipped',
+      selected: 'Selected',
+      selectedCount: count => `${count} selected`,
+      multiSelectHint: 'Multi-select: use the circle on the right to stage choices, then press Select selected.',
+      selectSelected: 'Select selected',
       continueLabel: 'Continue'
     },
     tool: {
@@ -2522,6 +2544,8 @@ export const en: Translations = {
     sessionUnavailable: 'Session unavailable',
     createSessionFailed: 'Could not create a new session',
     promptFailed: 'Prompt failed',
+    promptSubmitTimedOut:
+      'Hermes did not confirm this message in time. The backend may still process it, so wait a moment before retrying to avoid sending it twice.',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',
     desktopCommands: 'Desktop commands',

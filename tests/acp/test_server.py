@@ -1051,6 +1051,185 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_callback_setup_failure_clears_stale_worker_tls(
+        self, agent, monkeypatch
+    ):
+        """A reused executor's stale callback cannot approve a new ACP turn."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import acp_adapter.server as server_module
+        from tools import approval as approval_module
+        from tools import terminal_tool
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        stale_calls = []
+
+        def stale_callback(*_args, **_kwargs):
+            stale_calls.append(True)
+            return "once"
+
+        captured = {}
+
+        def mock_run(*_args, **_kwargs):
+            captured["authority"] = approval_module._acp_approval_authority_ctx.get()
+            captured["callback"] = terminal_tool._get_approval_callback()
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        mock_conn.request_permission = AsyncMock(return_value=None)
+        agent._conn = mock_conn
+
+        original_setter = terminal_tool.set_approval_callback
+        registration_calls = []
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr(server_module, "_executor", executor)
+            await loop.run_in_executor(executor, original_setter, stale_callback)
+
+            def fail_registration(_callback):
+                registration_calls.append(_callback)
+                if len(registration_calls) == 1:
+                    raise RuntimeError("injected callback registration failure")
+                original_setter(_callback)
+
+            monkeypatch.setattr(
+                terminal_tool,
+                "set_approval_callback",
+                fail_registration,
+            )
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=new_resp.session_id,
+            )
+            residual = await loop.run_in_executor(
+                executor,
+                terminal_tool._get_approval_callback,
+            )
+
+        assert captured == {"authority": True, "callback": None}
+        assert stale_calls == []
+        assert len(registration_calls) == 1
+        assert residual is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_success_clears_seeded_stale_worker_callback(
+        self, agent, monkeypatch
+    ):
+        """Successful ACP turns leave reused worker callback TLS empty."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import acp_adapter.server as server_module
+        from tools import approval as approval_module
+        from tools import terminal_tool
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        stale_calls = []
+
+        def stale_callback(*_args, **_kwargs):
+            stale_calls.append(True)
+            return "once"
+
+        captured = {}
+
+        def successful_run(*_args, **_kwargs):
+            captured["authority"] = approval_module._acp_approval_authority_ctx.get()
+            captured["callback_is_stale"] = (
+                terminal_tool._get_approval_callback() is stale_callback
+            )
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = successful_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        mock_conn.request_permission = AsyncMock(return_value=None)
+        agent._conn = mock_conn
+
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr(server_module, "_executor", executor)
+            await loop.run_in_executor(
+                executor,
+                terminal_tool.set_approval_callback,
+                stale_callback,
+            )
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=new_resp.session_id,
+            )
+            residual = await loop.run_in_executor(
+                executor,
+                lambda: (
+                    approval_module._acp_approval_authority_ctx.get(),
+                    terminal_tool._get_approval_callback(),
+                ),
+            )
+
+        assert captured == {"authority": True, "callback_is_stale": False}
+        assert stale_calls == []
+        assert residual == (False, None)
+
+    @pytest.mark.asyncio
+    async def test_prompt_exception_resets_authority_and_callback_on_worker(
+        self, agent, monkeypatch
+    ):
+        """Agent exceptions cannot leave ACP authority or callbacks in TLS."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import acp_adapter.server as server_module
+        from tools import approval as approval_module
+        from tools import terminal_tool
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        captured = {}
+        stale_calls = []
+
+        def stale_callback(*_args, **_kwargs):
+            stale_calls.append(True)
+            return "once"
+
+        def raising_run(*_args, **_kwargs):
+            captured["authority"] = approval_module._acp_approval_authority_ctx.get()
+            captured["callback_present"] = (
+                terminal_tool._get_approval_callback() is not None
+            )
+            raise RuntimeError("injected agent failure")
+
+        state.agent.run_conversation = raising_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        mock_conn.request_permission = AsyncMock(return_value=None)
+        agent._conn = mock_conn
+
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr(server_module, "_executor", executor)
+            await loop.run_in_executor(
+                executor,
+                terminal_tool.set_approval_callback,
+                stale_callback,
+            )
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=new_resp.session_id,
+            )
+            residual = await loop.run_in_executor(
+                executor,
+                lambda: (
+                    approval_module._acp_approval_authority_ctx.get(),
+                    terminal_tool._get_approval_callback(),
+                ),
+            )
+
+        assert captured == {"authority": True, "callback_present": True}
+        assert stale_calls == []
+        assert residual == (False, None)
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")
@@ -1099,6 +1278,52 @@ class TestPrompt:
             for call in mock_conn.session_update.call_args_list
         ]
         assert any(update.session_update == "agent_message_chunk" for update in updates)
+
+    @pytest.mark.asyncio
+    async def test_prompt_routes_commentary_as_message_without_hiding_final(self, agent):
+        """Visible Codex commentary is not private thought or final streaming.
+
+        ``already_streamed=True`` is a dedupe signal: ACP must not emit the
+        interim text again, and it must not suppress the real final response.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*_args, **_kwargs):
+            state.agent.interim_assistant_callback(
+                "Visible commentary", already_streamed=False
+            )
+            state.agent.interim_assistant_callback(
+                "Already streamed commentary", already_streamed=True
+            )
+            state.agent.reasoning_callback("Private analysis")
+            return {"final_response": "Final answer", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="help")],
+            session_id=new_resp.session_id,
+        )
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        visible_updates = [
+            (update.session_update, update.content.text)
+            for update in updates
+            if update.session_update
+            in {"agent_message_chunk", "agent_thought_chunk"}
+        ]
+        assert visible_updates == [
+            ("agent_message_chunk", "Visible commentary"),
+            ("agent_thought_chunk", "Private analysis"),
+            ("agent_message_chunk", "Final answer"),
+        ]
 
     @pytest.mark.asyncio
     async def test_prompt_suppresses_cancel_interrupt_sentinel(self, agent):
