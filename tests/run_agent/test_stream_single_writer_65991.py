@@ -175,6 +175,63 @@ class TestSingleWriterSink:
         agent._fire_stream_delta("plain")
         assert delivered == ["plain"]
 
+    def test_reentrant_claim_stops_old_delta_before_second_callback_and_record(self):
+        """A callback-started replacement cannot inherit the outer old delta."""
+        agent = _make_agent()
+        delivered = []
+        agent._stream_think_scrubber = None
+        agent._stream_context_scrubber = None
+
+        def display(text):
+            delivered.append(("display", text))
+            if text == "old":
+                agent._claim_stream_writer()
+                agent._fire_stream_delta("new")
+
+        agent.stream_delta_callback = display
+        agent._stream_callback = lambda text: delivered.append(("tts", text))
+        agent._claim_stream_writer()
+        agent._fire_stream_delta("old")
+
+        assert delivered == [
+            ("display", "old"),
+            ("display", "new"),
+            ("tts", "new"),
+        ]
+        assert agent._current_streamed_assistant_text == "new"
+
+    def test_reentrant_claim_during_tail_flush_cannot_reset_new_writer_state(self):
+        """A reset callback that starts a writer cannot have its state wiped."""
+        agent = _make_agent()
+        delivered = []
+
+        class TailScrubber:
+            def feed(self, text):
+                return text
+
+            def flush(self):
+                return "old-tail"
+
+        def display(text):
+            delivered.append(("display", text))
+            if text == "old-tail":
+                agent._claim_stream_writer()
+                agent._fire_stream_delta("new")
+
+        agent._stream_think_scrubber = TailScrubber()
+        agent._stream_context_scrubber = None
+        agent.stream_delta_callback = display
+        agent._stream_callback = lambda text: delivered.append(("tts", text))
+        agent._claim_stream_writer()
+        agent._reset_stream_delivery_tracking()
+
+        assert delivered == [
+            ("display", "old-tail"),
+            ("display", "new"),
+            ("tts", "new"),
+        ]
+        assert agent._current_streamed_assistant_text == "new"
+
 
 class TestSingleWriterLoop:
     @patch("run_agent.AIAgent._create_request_openai_client")

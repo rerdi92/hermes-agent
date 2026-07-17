@@ -4698,6 +4698,7 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking_locked(self) -> None:
         """Reset tracking while the writer-order lock is held."""
+        writer_generation = self._stream_writer_token
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -4715,12 +4716,13 @@ class AIAgent:
                     think_tail = ctx_scrubber.feed(think_tail)
                 if think_tail:
                     callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text_locked(think_tail)
+                    if not self._emit_stream_callbacks_locked(
+                        think_tail,
+                        callbacks,
+                        writer_generation,
+                        "_reset_stream_delivery_tracking:think_tail",
+                    ):
+                        return
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -4729,12 +4731,15 @@ class AIAgent:
             tail = scrubber.flush()
             if tail:
                 callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text_locked(tail)
+                if not self._emit_stream_callbacks_locked(
+                    tail,
+                    callbacks,
+                    writer_generation,
+                    "_reset_stream_delivery_tracking:context_tail",
+                ):
+                    return
+        if self._stream_writer_token != writer_generation:
+            return
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
@@ -4995,6 +5000,33 @@ class AIAgent:
         with self._stream_writer_lock:
             self._fire_stream_delta_locked(text)
 
+    def _emit_stream_callbacks_locked(
+        self,
+        text: str,
+        callbacks: list,
+        writer_generation: int,
+        where: str,
+    ) -> bool:
+        """Emit callbacks while aborting if one reentrantly claims a writer.
+
+        Returns False when the generation changed. Callers must then stop all
+        old-generation record/reset work so the replacement writer keeps sole
+        ownership of its callbacks and accumulated state.
+        """
+        delivered = False
+        for cb in callbacks:
+            try:
+                cb(text)
+                delivered = True
+            except Exception:
+                pass
+            if self._stream_writer_token != writer_generation:
+                self._note_dropped_stream_writer(where)
+                return False
+        if delivered:
+            self._record_streamed_assistant_text_locked(text)
+        return True
+
     def _fire_stream_delta_locked(self, text: str) -> None:
         """Emit one text delta while the writer-order lock is held."""
         # Single-writer guard (#65991): a superseded stream must not interleave
@@ -5043,15 +5075,13 @@ class AIAgent:
         if not text:
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text_locked(text)
+        writer_generation = self._stream_writer_token
+        self._emit_stream_callbacks_locked(
+            text,
+            callbacks,
+            writer_generation,
+            "_fire_stream_delta",
+        )
 
     def _fire_tool_suppressed_stream_delta(self, text: str) -> None:
         """Emit raw tool-suppressed content under the writer-order fence.
@@ -5068,21 +5098,15 @@ class AIAgent:
                     "_fire_tool_suppressed_stream_delta"
                 )
                 return
-            writer_token = getattr(self._stream_writer_tls, "token", None)
             if not self.stream_delta_callback:
                 return
-            try:
-                self.stream_delta_callback(text)
-            except Exception:
-                return
-            # A callback may re-enter and claim a newer writer through the
-            # RLock. The old callback already happened before that claim, but
-            # its text must not be accumulated into the replacement stream.
-            if writer_token is not None and not self._stream_writer_is_current(
-                writer_token
-            ):
-                return
-            self._record_streamed_assistant_text_locked(text)
+            writer_generation = self._stream_writer_token
+            self._emit_stream_callbacks_locked(
+                text,
+                [self.stream_delta_callback],
+                writer_generation,
+                "_fire_tool_suppressed_stream_delta",
+            )
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
