@@ -128,6 +128,15 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # dedup in #58265.
 NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
+# ``load_pool()`` returns a fresh ``CredentialPool`` on each call, including on
+# auxiliary-model hot paths.  The throttle therefore has to live at process
+# scope rather than on an individual pool instance.  Key by provider so a noisy
+# exhausted pool cannot suppress observability for an unrelated provider, and
+# guard check+update atomically because concurrent model calls may load separate
+# pool instances at the same time.
+_NO_AVAILABLE_ENTRIES_LOG_LAST_AT: Dict[str, float] = {}
+_NO_AVAILABLE_ENTRIES_LOG_LOCK = threading.Lock()
+
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
 # custom_providers name: 'custom:<normalized_name>'.
@@ -580,12 +589,6 @@ class CredentialPool:
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
-        # Monotonic timestamp of the last "no available entries" log, used to
-        # throttle that message so an empty/exhausted pool cannot storm the
-        # shared rotating log (see NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS).
-        # Re-armed to None on every successful selection so a recover→re-exhaust
-        # transition logs promptly instead of being swallowed by a stale window.
-        self._last_no_entries_log_at: Optional[float] = None
 
     def has_credentials(self) -> bool:
         return bool(self._entries)
@@ -1632,10 +1635,14 @@ class CredentialPool:
         event loop (see NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS).
         """
         now = time.monotonic()
-        last = self._last_no_entries_log_at
-        if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
-            return
-        self._last_no_entries_log_at = now
+        with _NO_AVAILABLE_ENTRIES_LOG_LOCK:
+            last = _NO_AVAILABLE_ENTRIES_LOG_LAST_AT.get(self.provider)
+            if (
+                last is not None
+                and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS
+            ):
+                return
+            _NO_AVAILABLE_ENTRIES_LOG_LAST_AT[self.provider] = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
     def _select_unlocked(self, *, refresh: bool = True) -> Optional[PooledCredential]:
@@ -1648,7 +1655,8 @@ class CredentialPool:
         # A successful selection means the pool recovered; re-arm the throttle
         # so a later re-exhaustion logs immediately rather than being silenced
         # by a window opened during the previous empty stretch.
-        self._last_no_entries_log_at = None
+        with _NO_AVAILABLE_ENTRIES_LOG_LOCK:
+            _NO_AVAILABLE_ENTRIES_LOG_LAST_AT.pop(self.provider, None)
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)

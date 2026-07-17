@@ -12,11 +12,16 @@ backend after 15000ms"). See #58265 for the same fix class on another message.
 from __future__ import annotations
 
 import logging
+import threading
 
+import pytest
+
+from agent import credential_pool as credential_pool_module
 from agent.credential_pool import (
     NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS,
     CredentialPool,
     PooledCredential,
+    load_pool,
 )
 
 _NO_ENTRIES_MSG = "credential pool: no available entries (all exhausted or empty)"
@@ -34,6 +39,15 @@ class _FakeClock:
 
 def _no_entries_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.getMessage() == _NO_ENTRIES_MSG]
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_throttle_state():
+    with credential_pool_module._NO_AVAILABLE_ENTRIES_LOG_LOCK:
+        credential_pool_module._NO_AVAILABLE_ENTRIES_LOG_LAST_AT.clear()
+    yield
+    with credential_pool_module._NO_AVAILABLE_ENTRIES_LOG_LOCK:
+        credential_pool_module._NO_AVAILABLE_ENTRIES_LOG_LAST_AT.clear()
 
 
 def _make_entry(entry_id: str) -> PooledCredential:
@@ -101,3 +115,59 @@ def test_successful_selection_rearms_throttle(monkeypatch, caplog):
         assert pool.select() is None  # re-armed -> log #2 immediately
 
     assert len(_no_entries_records(caplog)) == 2
+
+
+def test_fresh_load_pool_instances_share_throttle(monkeypatch, caplog):
+    """Hot-path reloads must not reset the no-entries throttle."""
+    clock = _FakeClock()
+    monkeypatch.setattr("agent.credential_pool.time.monotonic", clock)
+    monkeypatch.setattr(credential_pool_module, "read_credential_pool", lambda _provider: [])
+    monkeypatch.setattr(
+        credential_pool_module,
+        "_seed_from_singletons",
+        lambda _provider, _entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        credential_pool_module,
+        "_seed_from_env",
+        lambda _provider, _entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        credential_pool_module,
+        "_prune_stale_seeded_entries",
+        lambda _entries, _sources, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        credential_pool_module,
+        "_normalize_pool_priorities",
+        lambda _provider, _entries: False,
+    )
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        for _ in range(50):
+            clock.now += 0.1
+            assert load_pool("test-fresh-instance-throttle").select() is None
+
+    assert len(_no_entries_records(caplog)) == 1
+
+
+def test_concurrent_fresh_pool_instances_log_once(monkeypatch, caplog):
+    """Concurrent fresh instances must atomically share the throttle."""
+    clock = _FakeClock()
+    monkeypatch.setattr("agent.credential_pool.time.monotonic", clock)
+    worker_count = 20
+    barrier = threading.Barrier(worker_count)
+
+    def select_from_fresh_pool() -> None:
+        barrier.wait()
+        assert CredentialPool("test-concurrent-throttle", []).select() is None
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        threads = [threading.Thread(target=select_from_fresh_pool) for _ in range(worker_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    assert len(_no_entries_records(caplog)) == 1
