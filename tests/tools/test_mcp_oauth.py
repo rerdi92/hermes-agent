@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import sys
+import types
 from io import BytesIO
 from unittest.mock import patch, MagicMock
 
@@ -236,21 +237,42 @@ class TestUtilities:
         assert _can_open_browser() is False
 
     def test_can_open_browser_false_without_display(self, monkeypatch):
+        import tools.mcp_oauth as mco
+
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        # Mock os.name and uname for non-macOS, non-Windows
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
-        assert _can_open_browser() is False
+        # Replace only this module's OS view. Mutating process-global os.name on
+        # Windows makes pathlib.Path instantiate PosixPath while pytest is
+        # formatting the report, crashing the runner with INTERNALERROR.
+        monkeypatch.setattr(
+            mco,
+            "os",
+            types.SimpleNamespace(
+                environ=os.environ,
+                name="posix",
+                uname=lambda: types.SimpleNamespace(sysname="Linux"),
+            ),
+        )
+        assert mco._can_open_browser() is False
 
     def test_can_open_browser_true_with_display(self, monkeypatch):
+        import tools.mcp_oauth as mco
+
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setenv("DISPLAY", ":0")
-        monkeypatch.setattr(os, "name", "posix")
-        assert _can_open_browser() is True
+        monkeypatch.setattr(
+            mco,
+            "os",
+            types.SimpleNamespace(
+                environ=os.environ,
+                name="posix",
+                uname=lambda: types.SimpleNamespace(sysname="Linux"),
+            ),
+        )
+        assert mco._can_open_browser() is True
 
 
 class TestRedirectHandlerSshHint:
