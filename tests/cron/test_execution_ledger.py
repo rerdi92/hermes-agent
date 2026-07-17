@@ -39,6 +39,30 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_post_import_home_repoint_keeps_execution_ledger_profile_local(
+    monkeypatch, tmp_path
+):
+    """Late HERMES_HOME changes must never write the import-time profile DB."""
+    import cron.executions as executions
+
+    old_file = tmp_path / "old-profile" / "cron" / "executions.db"
+    old_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"old-profile-sentinel")
+    monkeypatch.setattr(executions, "_IMPORT_EXECUTIONS_FILE", old_file, raising=False)
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", old_file)
+
+    new_home = tmp_path / "new-profile"
+    monkeypatch.setenv("HERMES_HOME", str(new_home))
+
+    record = executions.create_execution("profile-job", source="builtin")
+    executions.mark_execution_running(record["id"])
+    executions.finish_execution(record["id"], success=True)
+
+    assert executions.latest_execution("profile-job")["status"] == "completed"
+    assert (new_home / "cron" / "executions.db").exists()
+    assert old_file.read_bytes() == b"old-profile-sentinel"
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
@@ -235,6 +259,52 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_create_execution_failure_releases_guard_and_allows_retry(monkeypatch):
+    import cron.scheduler as scheduler
+
+    create_calls = []
+    submit_calls = []
+    finished = []
+
+    def flaky_create(job_id, *, source):
+        create_calls.append((job_id, source))
+        if len(create_calls) == 1:
+            raise sqlite3.DatabaseError("ledger unavailable")
+        return {"id": "exec-retry"}
+
+    class RecordingPool:
+        def submit(self, _callable):
+            submit_calls.append(True)
+            raise ValueError("stop after proving retry dispatch")
+
+    monkeypatch.setattr(scheduler, "create_execution", flaky_create)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "ledger-retry"}])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: RecordingPool())
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert submit_calls == []
+    assert "ledger-retry" not in scheduler.get_running_job_ids()
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert submit_calls == [True]
+    assert finished == [
+        (
+            "exec-retry",
+            {
+                "success": False,
+                "error": "Executor dispatch failed: stop after proving retry dispatch",
+            },
+        )
+    ]
+    assert "ledger-retry" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

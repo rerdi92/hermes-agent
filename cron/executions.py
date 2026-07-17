@@ -19,15 +19,29 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+# Snapshot the compatibility constant at import so a deliberate monkeypatch of
+# EXECUTIONS_FILE remains authoritative, while an unchanged/stale constant does
+# not pin later profile-context or HERMES_HOME switches to the first import.
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _current_executions_file() -> Path:
+    """Resolve the active profile's ledger without breaking legacy overrides."""
+    live_constant = Path(EXECUTIONS_FILE).expanduser().resolve()
+    import_constant = Path(_IMPORT_EXECUTIONS_FILE).expanduser().resolve()
+    if live_constant != import_constant:
+        return live_constant
+    return get_hermes_home().resolve() / "cron" / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = _current_executions_file()
+    executions_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(executions_file, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
