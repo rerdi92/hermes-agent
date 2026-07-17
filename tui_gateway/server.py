@@ -175,6 +175,16 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # everything else stays on the main thread so ordering stays sane for the
 # fast path.  write_json is already _stdout_lock-guarded, so concurrent
 # response writes are safe.
+#
+# Dispatch policy contract:
+# - Add every frontend-polled RPC here unless it is proven in-memory-only.
+#   “Small” DB/file/network/process reads still starve the WS read loop under
+#   GIL pressure because handle_ws awaits dispatch() before reading the next
+#   frame on that socket (#50005).
+# - Keep truly trivial control responses inline so ordering stays predictable.
+# - Do not move live agent/session mutation into a ProcessPool without an
+#   explicit serialization boundary; use this thread pool or a dedicated
+#   subprocess instead.
 _LONG_HANDLERS = frozenset(
     {
         "billing.step_up",
@@ -202,6 +212,7 @@ _LONG_HANDLERS = frozenset(
         "pet.generate",
         "pet.hatch",
         "pet.info",
+        "pet.info.meta",
         "pet.select",
         "pet.thumb",
         "learning.frames",
@@ -2271,6 +2282,16 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+def _clarify_timeout_seconds() -> int:
+    """Return the configured clarify timeout for Desktop/TUI prompts."""
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+
+        return max(1, int(get_clarify_timeout()))
+    except Exception:
+        return 3600
+
+
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
@@ -4195,8 +4216,18 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+        "clarify_callback": lambda q, c, **kw: _block(
+            "clarify.request",
+            sid,
+            {
+                "question": q,
+                "choices": c,
+                "multi_select": bool(kw.get("multi_select", False)),
+                "min_selections": kw.get("min_selections", 0),
+                "max_selections": kw.get("max_selections"),
+                "allow_other": kw.get("allow_other", True),
+            },
+            timeout=_clarify_timeout_seconds(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -5802,6 +5833,31 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
     return info
 
 
+def _load_resume_histories(db, session_id: str) -> tuple[list, list, list]:
+    """Load model/display histories without treating repair shrinkage as ancestry."""
+    active_display_history = db.get_messages_as_conversation(session_id)
+    model_history = copy.deepcopy(active_display_history)
+    if model_history:
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        repaired = repair_message_sequence(None, model_history)
+        if repaired:
+            logger.info(
+                "Repaired %d message-alternation violation(s) while restoring "
+                "session %s; durable display transcript remains unchanged",
+                repaired,
+                session_id,
+            )
+    display_history = db.get_messages_as_conversation(
+        session_id, include_ancestors=True
+    )
+    # Use the unrepaired active length. repair_message_sequence can merge rows;
+    # subtracting its shorter result mistakes active rows for ancestors and then
+    # duplicates them when _live_session_payload joins prefix + working history.
+    prefix_len = max(0, len(display_history) - len(active_display_history))
+    return model_history, display_history, display_history[:prefix_len]
+
+
 def _deferred_session_record(
     session_key: str,
     *,
@@ -6073,8 +6129,7 @@ def _(rid, params: dict) -> dict:
             # LIVE REPLAY (raw_history → sanitize_replay_history → the resumed
             # session's working conversation). display_history stays verbatim —
             # inspection/export must show what is actually stored.
-            raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            raw_history, display_history, prefix = _load_resume_histories(db, target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -6082,7 +6137,6 @@ def _(rid, params: dict) -> dict:
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = display_history[: max(0, len(display_history) - len(raw_history))]
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -6149,9 +6203,8 @@ def _(rid, params: dict) -> dict:
         db.reopen_session(target)
         # repair_alternation on the model-fed copy only (see the interactive
         # resume above): this loads LIVE REPLAY history; display stays verbatim.
-        raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
+        raw_history, display_history, display_history_prefix = _load_resume_histories(
+            db, target
         )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
@@ -6160,9 +6213,6 @@ def _(rid, params: dict) -> dict:
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = display_history[
-            : max(0, len(display_history) - len(raw_history))
-        ]
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
@@ -9273,6 +9323,33 @@ def _notification_poller_loop(
         process_registry.completion_queue.put(evt)
 
 
+def _bound_agent_terminal_live_chunk(chunk: Any) -> str:
+    """Bound best-effort live terminal chunks before they cross Desktop WS.
+
+    The process registry keeps full output for explicit process(log)/poll reads.
+    The live read-only terminal stream is UI telemetry; sending a single huge
+    stdout/stderr frame through JSON-RPC can stall the renderer WebSocket and
+    trigger false lost-gateway overlays. Preserve the head/tail plus a marker so
+    the user sees what happened without flooding the transport.
+    """
+    text = chunk if isinstance(chunk, str) else str(chunk)
+    max_chars = 16_384
+    if len(text) <= max_chars:
+        return text
+
+    marker = (
+        "\r\n… [Hermes: middle omitted from live terminal stream; "
+        "use process(log) for full output] …\r\n"
+    )
+    budget = max_chars - len(marker)
+    if budget <= 0:
+        return marker[:max_chars]
+
+    head = budget // 2
+    tail = budget - head
+    return f"{text[:head]}{marker}{text[-tail:]}"
+
+
 def _wire_agent_terminal_output() -> None:
     """Idempotently route background-process output (and tab-close requests) to
     the desktop, keyed by process id. Read-only agent terminal tabs stream
@@ -9303,7 +9380,7 @@ def _wire_agent_terminal_output() -> None:
         _emit(
             "agent.terminal.output",
             _owner_sid_for_process(session),
-            {"process_id": session.id, "chunk": chunk},
+            {"process_id": session.id, "chunk": _bound_agent_terminal_live_chunk(chunk)},
         )
 
     def _emit_agent_terminal_close(session, process_id):
@@ -10641,6 +10718,74 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"task_id": task_id})
 
 
+def _coerce_clarify_response_from_payload(payload: dict, answer: str) -> tuple[bool, str, str]:
+    """Validate/normalize Desktop clarify replies before unblocking the agent.
+
+    The renderer is a convenience layer, not the trust boundary.  Keep the
+    server-side bridge aligned with ``tools.clarify_gateway`` so a stale or
+    buggy UI cannot turn a constrained single-select prompt into free-form or
+    multi-select input.
+    """
+    text = str(answer or "").strip()
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        choices = []
+    clean_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+    if not clean_choices:
+        return True, text, ""
+
+    multi_select = bool(payload.get("multi_select", False))
+    allow_other = bool(payload.get("allow_other", True))
+    try:
+        min_selections = int(payload.get("min_selections") or 0)
+    except (TypeError, ValueError):
+        min_selections = 0
+    max_raw = payload.get("max_selections")
+    try:
+        max_selections = int(max_raw) if max_raw is not None else None
+    except (TypeError, ValueError):
+        max_selections = None
+
+    if not text:
+        if multi_select and min_selections > 0:
+            return False, "", f"Select at least {min_selections} choices."
+        if not multi_select and not allow_other:
+            return False, "", "Reply with one of the listed choices."
+        return True, "", ""
+
+    if multi_select:
+        try:
+            from tools.clarify_gateway import parse_multi_select_response
+
+            parsed = parse_multi_select_response(text, clean_choices)
+        except Exception:
+            parsed = None
+        if parsed:
+            if len(parsed) < min_selections:
+                return False, "", f"Select at least {min_selections} choices."
+            if max_selections is not None and len(parsed) > max_selections:
+                return False, "", f"Select at most {max_selections} choices."
+            return True, ", ".join(parsed), ""
+        if allow_other:
+            return True, text, ""
+        return False, "", "Reply with one or more listed choices."
+
+    label_map = {choice.casefold(): choice for choice in clean_choices}
+    exact = label_map.get(text.casefold())
+    if exact is not None:
+        return True, exact, ""
+    try:
+        idx = int(text) - 1
+    except ValueError:
+        idx = -1
+    if 0 <= idx < len(clean_choices):
+        return True, clean_choices[idx], ""
+    if allow_other:
+        return True, text, ""
+    return False, "", "Reply with one of the listed choices."
+
+
 # ── Methods: respond ─────────────────────────────────────────────────
 
 
@@ -10660,6 +10805,18 @@ def _respond(rid, params, key, *, allow_expired=False):
 
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
+    request_id = params.get("request_id", "")
+    answer = params.get("answer", "")
+    with _prompt_lock:
+        prompt_payload = _pending_prompt_payloads.get(request_id)
+    if prompt_payload and prompt_payload[0] == "clarify.request":
+        ok, coerced, message = _coerce_clarify_response_from_payload(
+            prompt_payload[1], str(answer),
+        )
+        if not ok:
+            return _err(rid, 4010, message or "Invalid clarify response")
+        params = dict(params)
+        params["answer"] = coerced
     return _respond(rid, params, "answer")
 
 

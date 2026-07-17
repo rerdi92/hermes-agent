@@ -2,10 +2,12 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
+
+import type { SkillsView as SkillsViewComponent } from './index'
 
 const getSkills = vi.fn()
 const getToolsets = vi.fn()
@@ -35,6 +37,12 @@ vi.mock('@/store/notifications', () => ({
   notifyError: vi.fn()
 }))
 
+let SkillsView: typeof SkillsViewComponent
+
+beforeAll(async () => {
+  ;({ SkillsView } = await import('./index'))
+}, 30_000)
+
 function toolset(overrides: Record<string, unknown> = {}) {
   return {
     name: 'web',
@@ -49,7 +57,6 @@ function toolset(overrides: Record<string, unknown> = {}) {
 }
 
 async function renderSkills() {
-  const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(

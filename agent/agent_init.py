@@ -758,7 +758,9 @@ def init_agent(
     # threading.local means threads that never claimed (non-streaming callers)
     # are never fenced, so the guard can only ever drop a superseded stream,
     # never the single legitimate writer.
-    agent._stream_writer_lock = threading.Lock()
+    # Claims and externally visible emissions share one total-order lock.
+    # Re-entrancy is needed because emission records text via a guarded helper.
+    agent._stream_writer_lock = threading.RLock()
     agent._stream_writer_token = 0
     agent._stream_writer_tls = threading.local()
     agent._stream_writer_dropped = 0

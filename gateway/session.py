@@ -1029,6 +1029,7 @@ class SessionStore:
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         self._transcript_retry_lock = threading.Lock()
+        self._transcript_session_locks: Dict[str, threading.RLock] = {}
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
@@ -2511,6 +2512,32 @@ class SessionStore:
         """
         if not self._db or skip_db:
             return
+        # One owner drains a session queue at a time. Different sessions use
+        # different locks, so a slow DB write for one chat does not block the
+        # rest of the gateway. Destructive transcript operations take this
+        # same lock through their DB mutation, preventing an in-flight stale
+        # append from landing after a rewrite/rewind.
+        with self._transcript_session_lock_for(session_id):
+            self._append_to_transcript_serialized(session_id, message)
+
+    def _transcript_session_lock_for(self, session_id: str) -> threading.RLock:
+        """Return the stable per-session transcript mutation lock."""
+        with self._transcript_retry_lock:
+            locks = getattr(self, "_transcript_session_locks", None)
+            if locks is None:
+                # Compatibility for narrowly-constructed test/store objects.
+                locks = {}
+                self._transcript_session_locks = locks
+            lock = locks.get(session_id)
+            if lock is None:
+                lock = threading.RLock()
+                locks[session_id] = lock
+            return lock
+
+    def _append_to_transcript_serialized(
+        self, session_id: str, message: Dict[str, Any]
+    ) -> None:
+        """Queue and drain one session while its mutation lock is held."""
         with self._transcript_retry_lock:
             pending = self._dirty_transcripts.setdefault(session_id, [])
             pending.append(dict(message))
@@ -2544,6 +2571,8 @@ class SessionStore:
                             if not pending:
                                 self._dirty_transcripts.pop(session_id, None)
                                 self._transcript_append_failures.pop(session_id, None)
+                                return
+                            msg = pending[0]
                         continue
                 with self._transcript_retry_lock:
                     failures = self._transcript_append_failures.get(session_id, 0) + 1
@@ -2601,7 +2630,6 @@ class SessionStore:
             marker in text
             for marker in (
                 "database disk image is malformed",
-                "malformed database schema",
                 "messages_fts",
                 "no such table: messages_fts",
             )
@@ -2614,9 +2642,12 @@ class SessionStore:
         table-existence checks internally. Returns ``True`` when at least
         one index was rebuilt.
         """
-        if self._fts_rebuild_attempted:
-            return False
-        self._fts_rebuild_attempted = True
+        # Reserve the single attempt atomically. The rebuild itself stays
+        # outside this lock because SessionDB owns its DB lock and may block.
+        with self._transcript_retry_lock:
+            if self._fts_rebuild_attempted:
+                return False
+            self._fts_rebuild_attempted = True
         db = self._db
         if db is None or not hasattr(db, "rebuild_fts"):
             return False
@@ -2640,9 +2671,10 @@ class SessionStore:
         don't leave stale messages that would be re-inserted on the next
         append.
         """
-        with self._transcript_retry_lock:
-            self._dirty_transcripts.pop(session_id, None)
-            self._transcript_append_failures.pop(session_id, None)
+        with self._transcript_session_lock_for(session_id):
+            with self._transcript_retry_lock:
+                self._dirty_transcripts.pop(session_id, None)
+                self._transcript_append_failures.pop(session_id, None)
     
     def has_platform_message_id(
         self, session_id: str, platform_message_id: str
@@ -2678,6 +2710,13 @@ class SessionStore:
         """
         if not self._db:
             return True
+        with self._transcript_session_lock_for(session_id):
+            return self._rewrite_transcript_locked(session_id, messages)
+
+    def _rewrite_transcript_locked(
+        self, session_id: str, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """Replace a transcript while the session mutation lock is held."""
         self._clear_dirty_transcript(session_id)
         try:
             self._db.replace_messages(session_id, messages)
@@ -2721,6 +2760,13 @@ class SessionStore:
         """
         if not self._db:
             return None
+        with self._transcript_session_lock_for(session_id):
+            return self._rewind_session_locked(session_id, n)
+
+    def _rewind_session_locked(
+        self, session_id: str, n: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Rewind while the session transcript mutation lock is held."""
         self._clear_dirty_transcript(session_id)
         if n < 1:
             n = 1

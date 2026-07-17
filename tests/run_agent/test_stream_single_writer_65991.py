@@ -37,6 +37,58 @@ def _chunk(content=None, finish_reason=None, model=None):
 
 
 class TestSingleWriterSink:
+    def test_new_claim_cannot_overtake_checked_emission(self):
+        """Claim and callback emission have one total order.
+
+        A newer writer that starts after the old writer passed its stale check
+        must not emit first and then let the old delta land behind it.
+        """
+        agent = _make_agent()
+        delivered = []
+        agent.stream_delta_callback = lambda text: delivered.append(text)
+        agent._stream_callback = None
+        agent._stream_think_scrubber = None
+        agent._stream_context_scrubber = None
+
+        old_in_transform = threading.Event()
+        release_old = threading.Event()
+        new_claim_started = threading.Event()
+        new_claimed = threading.Event()
+
+        def blocking_strip(text):
+            if text == "old":
+                old_in_transform.set()
+                assert release_old.wait(timeout=2)
+            return text
+
+        agent._strip_think_blocks = blocking_strip
+
+        def old_writer():
+            agent._claim_stream_writer()
+            agent._fire_stream_delta("old")
+
+        def new_writer():
+            assert old_in_transform.wait(timeout=2)
+            new_claim_started.set()
+            agent._claim_stream_writer()
+            new_claimed.set()
+            agent._fire_stream_delta("new")
+
+        old = threading.Thread(target=old_writer)
+        new = threading.Thread(target=new_writer)
+        old.start()
+        assert old_in_transform.wait(timeout=2)
+        new.start()
+        assert new_claim_started.wait(timeout=2)
+        new_overtook_inflight_emission = new_claimed.wait(timeout=0.2)
+        release_old.set()
+        old.join(timeout=2)
+        new.join(timeout=2)
+
+        assert not new_overtook_inflight_emission
+        assert delivered == ["old", "new"]
+        assert not old.is_alive() and not new.is_alive()
+
     def test_superseded_writer_deltas_are_dropped(self):
         """A stale writer (older token, other thread) is fenced; only the
         newest writer reaches the callbacks and the accumulated turn text."""

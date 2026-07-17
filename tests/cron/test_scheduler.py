@@ -1125,6 +1125,47 @@ class TestRunJobSessionPersistence:
         assert "IMPORTANT" not in title
         assert title.startswith("Morning digest")
 
+    def test_run_job_cleans_up_when_title_and_lineage_fallback_both_fail(self, tmp_path):
+        """Title recovery failures must never skip DB or agent teardown."""
+        job = {
+            "id": "cleanup-job",
+            "name": "cleanup",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        fake_db.set_session_title.side_effect = RuntimeError("title db unavailable")
+        fake_db.get_next_title_in_lineage.side_effect = RuntimeError(
+            "lineage db unavailable"
+        )
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+        mock_agent.close.assert_called_once()
+
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
         # agent was previously leaked — over days of ticks this accumulated

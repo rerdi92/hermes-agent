@@ -74,9 +74,17 @@ from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
+import tools.approval as _approval_module
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
+)
+
+_set_acp_approval_authority_context = getattr(
+    _approval_module, "set_acp_approval_authority_context"
+)
+_reset_acp_approval_authority_context = getattr(
+    _approval_module, "reset_acp_approval_authority_context"
 )
 
 logger = logging.getLogger(__name__)
@@ -1418,6 +1426,19 @@ class HermesACPAgent(acp.Agent):
                     streamed_message = True
                 message_cb(text)
 
+            def interim_assistant_cb(
+                text: str, *, already_streamed: bool = False
+            ) -> None:
+                # Codex commentary is user-visible mid-turn assistant text, not
+                # private reasoning.  ``already_streamed`` means the normal
+                # response stream already rendered these bytes, so emitting an
+                # ACP chunk would duplicate them.  Deliberately do not mutate
+                # ``streamed_message``: commentary must never suppress the real
+                # final answer at the end of the turn.
+                if already_streamed or not str(text or "").strip():
+                    return
+                message_cb(text)
+
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
@@ -1435,6 +1456,7 @@ class HermesACPAgent(acp.Agent):
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
+            interim_assistant_cb = None
             approval_cb = None
 
         agent = state.agent
@@ -1446,6 +1468,7 @@ class HermesACPAgent(acp.Agent):
         agent.reasoning_callback = reasoning_cb
         agent.step_callback = step_cb
         agent.stream_delta_callback = stream_delta_cb
+        agent.interim_assistant_callback = interim_assistant_cb
 
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
@@ -1460,13 +1483,13 @@ class HermesACPAgent(acp.Agent):
         # ACP's conn.request_permission maps cleanly to the interactive
         # callback shape — not the gateway-queue HERMES_EXEC_ASK path,
         # which requires a notify_cb registered in _gateway_notify_cbs.
-        previous_approval_cb = None
         interactive_token = None
+        approval_authority_token = None
         edit_approval_token = None
         previous_session_id = None
 
         def _run_agent() -> dict:
-            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal interactive_token, approval_authority_token, edit_approval_token, previous_session_id
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1483,13 +1506,21 @@ class HermesACPAgent(acp.Agent):
                 session_tokens = None
                 clear_session_vars = None  # type: ignore[assignment]
                 logger.debug("Could not set ACP session context", exc_info=True)
-            if approval_cb:
-                try:
-                    from tools import terminal_tool as _terminal_tool
-                    previous_approval_cb = _terminal_tool._get_approval_callback()
+            try:
+                from tools import terminal_tool as _terminal_tool
+
+                # A reused executor thread may contain an old callback. Clear
+                # it before installing this turn's callback so a setup failure
+                # is fail-closed instead of invoking stale human authority.
+                getattr(_terminal_tool, "clear_approval_callback")()
+                if approval_cb:
                     _terminal_tool.set_approval_callback(approval_cb)
+            except Exception:
+                logger.debug("Could not set ACP approval callback", exc_info=True)
+                try:
+                    getattr(_terminal_tool, "clear_approval_callback")()
                 except Exception:
-                    logger.debug("Could not set ACP approval callback", exc_info=True)
+                    logger.debug("Could not clear ACP approval callback", exc_info=True)
             if edit_approval_requester:
                 try:
                     from acp_adapter.edit_approval import set_edit_approval_requester
@@ -1497,19 +1528,26 @@ class HermesACPAgent(acp.Agent):
                     edit_approval_token = set_edit_approval_requester(edit_approval_requester)
                 except Exception:
                     logger.debug("Could not set ACP edit approval requester", exc_info=True)
-            # Signal to tools.approval that we have an interactive callback
-            # and the non-interactive auto-approve path must not fire. Uses a
-            # contextvar (not os.environ) so concurrent executor workers don't
-            # race on the flag (GHSA-96vc-wcxf-jjff).
-            interactive_token = set_hermes_interactive_context(True)
-            # Propagate the originating ACP session id to tools that want to
-            # tag side-effects with it (e.g. ``kanban_create`` stamps it on
-            # the new task so clients can render a per-session board). Save
-            # and restore around the agent call so a re-used executor thread
-            # never leaks one session's id into the next session's tools.
+            # Save the outer process-global session id before entering the
+            # protected setup region so every subsequent mutation is restored.
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
-            os.environ["HERMES_SESSION_ID"] = session_id
             try:
+                # Signal to tools.approval that we have an interactive callback
+                # and the non-interactive auto-approve path must not fire. Uses a
+                # contextvar (not os.environ) so concurrent executor workers don't
+                # race on the flag (GHSA-96vc-wcxf-jjff).
+                interactive_token = set_hermes_interactive_context(True)
+                # ACP's request_permission callback is the editor owner's final
+                # decision. Smart Approval may advise but cannot auto-approve ahead
+                # of it. Set this even when callback setup failed so the guard
+                # denies rather than silently falling back to auxiliary approval.
+                approval_authority_token = _set_acp_approval_authority_context(True)
+                # Propagate the originating ACP session id to tools that want to
+                # tag side-effects with it (e.g. ``kanban_create`` stamps it on
+                # the new task so clients can render a per-session board). Save
+                # and restore around the agent call so a re-used executor thread
+                # never leaks one session's id into the next session's tools.
+                os.environ["HERMES_SESSION_ID"] = session_id
                 result = agent.run_conversation(
                     user_message=user_content,
                     conversation_history=state.history,
@@ -1521,6 +1559,8 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                if approval_authority_token is not None:
+                    _reset_acp_approval_authority_context(approval_authority_token)
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
@@ -1529,12 +1569,12 @@ class HermesACPAgent(acp.Agent):
                     os.environ.pop("HERMES_SESSION_ID", None)
                 else:
                     os.environ["HERMES_SESSION_ID"] = previous_session_id
-                if approval_cb:
-                    try:
-                        from tools import terminal_tool as _terminal_tool
-                        _terminal_tool.set_approval_callback(previous_approval_cb)
-                    except Exception:
-                        logger.debug("Could not restore approval callback", exc_info=True)
+                try:
+                    from tools import terminal_tool as _terminal_tool
+
+                    getattr(_terminal_tool, "clear_approval_callback")()
+                except Exception:
+                    logger.debug("Could not clear approval callback", exc_info=True)
                 if edit_approval_token is not None:
                     try:
                         from acp_adapter.edit_approval import reset_edit_approval_requester
