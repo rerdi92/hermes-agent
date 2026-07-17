@@ -17,6 +17,17 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+@pytest.fixture(autouse=True)
+def _block_host_audio_and_browser_launch(monkeypatch):
+    """Keep gateway unit tests from producing host-visible side effects."""
+    monkeypatch.delenv("HERMES_VOICE_TTS", raising=False)
+    monkeypatch.setattr("hermes_cli.voice.speak_text", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.browser_connect.launch_chrome_debug",
+        lambda *_args, **_kwargs: ChromeDebugLaunch(),
+    )
+
+
 def test_agent_terminal_output_is_capped_before_desktop_ws(monkeypatch):
     """Live background-process terminal output must not flood Desktop WS.
 
@@ -8574,12 +8585,14 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
-        ):
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=ChromeDebugLaunch(launched=True),
+        ) as launch:
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
             )
 
+    launch.assert_called_once()
     assert resp["result"]["connected"] is True
     assert resp["result"]["url"] == "http://127.0.0.1:9222"
     assert resp["result"]["messages"] == [
