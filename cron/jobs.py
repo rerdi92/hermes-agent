@@ -98,6 +98,12 @@ _jobs_lock_state = threading.local()
 # legitimate critical section (field updates only) while keeping the ticker's
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class CrossProcessJobsLockUnavailable(RuntimeError):
+    """A CAS mutation could not obtain the OS-level jobs lock."""
+
+
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -254,7 +260,7 @@ def _jobs_lock_file() -> Path:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -275,6 +281,12 @@ def _jobs_lock():
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(
+            _jobs_lock_state, "cross_process_acquired", False
+        ):
+            raise CrossProcessJobsLockUnavailable(
+                "nested cron mutation has no cross-process jobs lock"
+            )
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -284,6 +296,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_acquired = False
         lock_fd = None
         try:
             try:
@@ -309,6 +322,7 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_acquired = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
@@ -329,11 +343,22 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_acquired = True
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
+            if require_cross_process and not _jobs_lock_state.cross_process_acquired:
+                if lock_fd is not None:
+                    try:
+                        lock_fd.close()
+                    except OSError:
+                        pass
+                    lock_fd = None
+                raise CrossProcessJobsLockUnavailable(
+                    f"cross-process cron jobs lock unavailable: {_jobs_lock_file()}"
+                )
             try:
                 yield
             finally:
@@ -349,6 +374,7 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_acquired = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -1707,16 +1733,23 @@ def release_run_claim(job_id: str, *, expected_claim: dict) -> bool:
     """
     if not isinstance(expected_claim, dict):
         return False
-    with _jobs_lock():
-        jobs = load_jobs()
-        for job in jobs:
-            if job.get("id") != job_id:
-                continue
-            if job.get("run_claim") != expected_claim:
-                return False
-            job["run_claim"] = None
-            save_jobs(jobs)
-            return True
+    try:
+        with _jobs_lock(require_cross_process=True):
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                if job.get("run_claim") != expected_claim:
+                    return False
+                job["run_claim"] = None
+                save_jobs(jobs)
+                return True
+    except CrossProcessJobsLockUnavailable:
+        logger.error(
+            "Refusing to release run_claim for %s without cross-process lock",
+            job_id,
+        )
+        return False
     return False
 
 

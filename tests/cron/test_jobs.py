@@ -21,6 +21,7 @@ from cron.jobs import (
     advance_next_run,
     claim_dispatch,
     heartbeat_run_claim,
+    release_run_claim,
     get_due_jobs,
     save_job_output,
 )
@@ -1263,6 +1264,63 @@ class TestGetDueJobs:
 
         assert heartbeat_run_claim("recurring", expected_owner="owner") is False
         assert get_job("recurring")["run_claim"]["at"] == original_at
+
+    def test_release_run_claim_fails_closed_without_cross_process_lock(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A stale releaser must not write while the OS jobs lock is degraded."""
+        import contextlib
+        import cron.jobs as jobs
+
+        claim = {"at": datetime.now(timezone.utc).isoformat(), "by": "owner"}
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        save_jobs([{
+            "id": "claimed", "name": "R", "prompt": "x",
+            "schedule": {"kind": "once", "run_at": future},
+            "next_run_at": future, "enabled": True,
+            "run_claim": claim,
+        }])
+        requirements = []
+
+        @contextlib.contextmanager
+        def degraded_lock(*, require_cross_process=False):
+            requirements.append(require_cross_process)
+            if require_cross_process:
+                raise jobs.CrossProcessJobsLockUnavailable("degraded")
+            yield
+
+        monkeypatch.setattr(jobs, "_jobs_lock", degraded_lock)
+
+        assert release_run_claim("claimed", expected_claim=claim) is False
+        assert get_job("claimed")["run_claim"] == claim
+        assert requirements[0] is True
+
+    def test_required_jobs_lock_timeout_raises_and_cleans_state(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Strict CAS callers never enter a degraded critical section."""
+        import cron.jobs as jobs
+
+        class AlwaysLocked:
+            LOCK_EX = 1
+            LOCK_NB = 2
+            LOCK_UN = 8
+
+            @staticmethod
+            def flock(_fd, operation):
+                if operation != AlwaysLocked.LOCK_UN:
+                    raise OSError("held by sibling")
+
+        monkeypatch.setattr(jobs, "fcntl", AlwaysLocked)
+        monkeypatch.setattr(jobs, "msvcrt", None)
+        monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.0)
+
+        with pytest.raises(jobs.CrossProcessJobsLockUnavailable):
+            with jobs._jobs_lock(require_cross_process=True):
+                raise AssertionError("degraded strict lock must never yield")
+
+        assert getattr(jobs._jobs_lock_state, "depth", 0) == 0
+        assert not getattr(jobs._jobs_lock_state, "cross_process_acquired", False)
 
 
     def test_broken_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
