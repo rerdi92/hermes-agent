@@ -20,9 +20,9 @@ describe('applyUltraModePrefix', () => {
   })
 
   it('does not duplicate an explicit mode trigger already typed by the user', () => {
-    expect(applyUltraModePrefix('ulr compare these papers', { agentFleet: true, ultrawork: true, ultraresearch: true })).toBe(
-      'ulr compare these papers'
-    )
+    expect(
+      applyUltraModePrefix('ulr compare these papers', { agentFleet: true, ultrawork: true, ultraresearch: true })
+    ).toBe('ulr compare these papers')
   })
 
   it('leaves prompts unchanged when both toggles are off', () => {

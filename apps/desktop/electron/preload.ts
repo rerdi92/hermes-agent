@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     onChanged: callback => {
       const listener = (_event, payload) => callback(payload)
       ipcRenderer.on('hermes:pinnedSessions:changed', listener)
+
       return () => ipcRenderer.removeListener('hermes:pinnedSessions:changed', listener)
     }
   },

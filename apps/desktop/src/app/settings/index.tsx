@@ -72,6 +72,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
       if (legacyTab === 'mcp') {
         const server = params.get('server')
+
         if (server) {
           targetParams.set('server', server)
         }

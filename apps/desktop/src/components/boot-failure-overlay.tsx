@@ -318,12 +318,8 @@ export function BootFailureOverlay() {
         <div className="flex items-start gap-3 px-5 py-4">
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
-            <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {title}
-            </h2>
-            <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {description}
-            </p>
+            <h2 className="text-[0.9375rem] font-semibold tracking-tight">{title}</h2>
+            <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">{description}</p>
           </div>
         </div>
 

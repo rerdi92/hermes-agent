@@ -8,7 +8,9 @@ function flushMicrotasks() {
   return new Promise(resolve => setTimeout(resolve, 0))
 }
 
-async function loadLayoutWithPinnedBridge(snapshot: PinnedPayload = { exists: false, ids: [], path: '/tmp/pins.json' }) {
+async function loadLayoutWithPinnedBridge(
+  snapshot: PinnedPayload = { exists: false, ids: [], path: '/tmp/pins.json' }
+) {
   vi.resetModules()
   window.localStorage.clear()
 

@@ -16,7 +16,7 @@ import {
   requestBackendShutdown,
   requestRelaunchWithRecovery,
   runOperationWithPostRelease,
-  runRelaunchQuitHandoff,
+  runRelaunchQuitHandoff
 } from './desktop-relaunch'
 
 class FakeChild extends EventEmitter {
@@ -103,7 +103,14 @@ test('lifecycle gate fences competing teardown and PTY operations throughout a p
   assert.equal(first, second)
   assert.equal(lifecycle.active, true)
 
-  for (const operation of ['backend startup', 'update', 'uninstall', 'connection apply', 'profile switch', 'terminal start']) {
+  for (const operation of [
+    'backend startup',
+    'update',
+    'uninstall',
+    'connection apply',
+    'profile switch',
+    'terminal start'
+  ]) {
     assert.throws(() => lifecycle.assertOperationAllowed(operation), /relaunching/)
   }
 
@@ -151,7 +158,10 @@ test('lifecycle operation leases block relaunch in both race directions', async 
 
   const relaunch = lifecycle.request()
   assert.equal(lifecycle.draining, true)
-  await assert.rejects(lifecycle.runOperation('update', async () => undefined), /relaunching/)
+  await assert.rejects(
+    lifecycle.runOperation('update', async () => undefined),
+    /relaunching/
+  )
   releaseDrain?.()
   assert.deepEqual(await relaunch, { ok: true, reason: 'relaunching' })
   assert.equal(coordinateCalls, 1)
@@ -161,10 +171,9 @@ test('lifecycle operation leases block relaunch in both race directions', async 
 test('durable handoff dwell blocks every new lifecycle operation after the owner lease returns', async () => {
   let handoffActive = false
 
-  const lifecycle = createDesktopRelaunchLifecycle(
-    async () => ({ ok: true, reason: 'relaunching' }),
-    { isHandoffActive: () => handoffActive }
-  )
+  const lifecycle = createDesktopRelaunchLifecycle(async () => ({ ok: true, reason: 'relaunching' }), {
+    isHandoffActive: () => handoffActive
+  })
 
   await lifecycle.runOperation('update', async () => {
     handoffActive = true
@@ -181,7 +190,10 @@ test('durable handoff dwell blocks every new lifecycle operation after the owner
     'uninstall'
   ]) {
     assert.throws(() => lifecycle.assertOperationAllowed(operation), /handoff/)
-    await assert.rejects(lifecycle.runOperation(operation, async () => undefined), /handoff/)
+    await assert.rejects(
+      lifecycle.runOperation(operation, async () => undefined),
+      /handoff/
+    )
   }
 
   assert.deepEqual(await lifecycle.request(), { ok: false, reason: 'handoff-active' })
@@ -222,7 +234,10 @@ test('owned pool startup shares one promise, holds the lifecycle lease, and reje
   const first = ensureDesktopOwnedStartup(options)
   const second = ensureDesktopOwnedStartup(options)
   assert.equal(first, second)
-  await assert.rejects(lifecycle.runOperation('connection apply', async () => undefined), /operation is active/)
+  await assert.rejects(
+    lifecycle.runOperation('connection apply', async () => undefined),
+    /operation is active/
+  )
   assert.deepEqual(await lifecycle.request(), { ok: false, reason: 'operation-active' })
 
   const staleEntry = entries.get('researcher')
@@ -291,7 +306,10 @@ test('primary startup lease blocks update and relaunch across deferred startup w
   })
 
   assert.equal(startupStarted, true)
-  await assert.rejects(lifecycle.runOperation('update', async () => undefined), /operation is active/)
+  await assert.rejects(
+    lifecycle.runOperation('update', async () => undefined),
+    /operation is active/
+  )
   assert.deepEqual(await lifecycle.request(), { ok: false, reason: 'operation-active' })
   assert.equal(coordinateCalls, 0)
   releaseStartup?.()
@@ -562,9 +580,11 @@ test('relaunch publication failure recovery holds a real lease against competing
   const recoveryGate = new Promise<void>(resolve => {
     releaseRecovery = resolve
   })
+
   const recoveryStarted = new Promise<void>(resolve => {
     signalRecoveryStarted = resolve
   })
+
   const coordinate = createGracefulRelaunchCoordinator({
     getTargets: () => [],
     preflight: () => ({ ok: true as const }),
@@ -574,6 +594,7 @@ test('relaunch publication failure recovery holds a real lease against competing
     },
     shutdownTargets: async () => ({ ok: true as const, results: [] })
   })
+
   const lifecycle = createDesktopRelaunchLifecycle(coordinate, {
     isRelaunchPending: () => coordinate.relaunchIssued
   })
@@ -583,9 +604,11 @@ test('relaunch publication failure recovery holds a real lease against competing
     await recoveryGate
     assertActive()
   })
+
   await recoveryStarted
 
   let competingError: unknown
+
   try {
     await lifecycle.runOperation('update', async () => undefined)
   } catch (error) {

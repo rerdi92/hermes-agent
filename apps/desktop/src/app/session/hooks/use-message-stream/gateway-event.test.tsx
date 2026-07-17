@@ -39,10 +39,9 @@ function clientSession(overrides: Partial<ClientSessionState> = {}): ClientSessi
 }
 
 function renderGatewayEventHandler() {
-  const updateSessionState = vi.fn((
-    _sessionId: string,
-    updater: (state: ClientSessionState) => ClientSessionState
-  ) => updater(clientSession()))
+  const updateSessionState = vi.fn((_sessionId: string, updater: (state: ClientSessionState) => ClientSessionState) =>
+    updater(clientSession())
+  )
 
   const { result } = renderHook(() =>
     useGatewayEventHandler({

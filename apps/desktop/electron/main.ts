@@ -2644,6 +2644,7 @@ async function handOffWindowsBootstrapRecoveryImpl(reason, assertActive) {
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     : configuredBranch || DEFAULT_UPDATE_BRANCH
+
   assertActive()
 
   const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
@@ -4665,6 +4666,7 @@ function buildApplicationMenu() {
     label: 'Check for Updates…',
     click: () => sendOpenUpdatesRequested()
   }
+
   const restartHermesItem = {
     label: `Restart ${APP_NAME}`,
     click: () => {
@@ -6635,10 +6637,12 @@ const coordinateGracefulDesktopRelaunch = createGracefulRelaunchCoordinator({
   relaunch: () => app.relaunch(),
   shutdownTargets: targets => requestBackendGroupShutdown(targets)
 })
+
 const gracefulDesktopRelaunch = createDesktopRelaunchLifecycle(coordinateGracefulDesktopRelaunch, {
   isHandoffActive: () => isQuittingForHandoff,
   isRelaunchPending: () => coordinateGracefulDesktopRelaunch.relaunchIssued
 })
+
 const primaryStartupFence = createDesktopStartupFence(gracefulDesktopRelaunch)
 
 async function requestGracefulDesktopRelaunch() {
@@ -6801,6 +6805,7 @@ async function evictLruPoolBackends(keep, activeLease: (() => void) | null = nul
       if (removable <= 0) {
         break
       }
+
       rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${POOL_MAX_BACKENDS})`)
       await teardownPoolBackendAndWait(profile)
       assertActive()
@@ -6969,6 +6974,7 @@ async function spawnPoolBackend(profile, entry, assertCurrent: () => void) {
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
   })
+
   assertCurrent()
 
   entry.token = authToken
@@ -6992,6 +6998,7 @@ function stopPoolBackend(profile) {
   if (!entry) {
     return
   }
+
   invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
   stopBackendChild(entry.process)
 }
@@ -7002,6 +7009,7 @@ async function teardownPoolBackendAndWait(profile) {
   if (!entry) {
     return
   }
+
   invalidateDesktopOwnedStartupEntry(backendPool, profile, entry)
 
   stopBackendChild(entry.process)
@@ -7077,8 +7085,10 @@ async function startHermes(activeLease: (() => void) | null = null) {
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
+
   const runPrimaryStartup = (assertLease: () => void) => {
     const generation = primaryStartupFence.begin()
+
     const assertPrimaryStartupCurrent = () => {
       assertLease()
       primaryStartupFence.assertCurrent(generation)
@@ -7193,6 +7203,7 @@ async function startHermes(activeLease: (() => void) | null = null) {
           stdio: ['ignore', 'pipe', 'pipe']
         })
       )
+
       const processOwner = backendConnectionState.attachProcess(connectionAttempt, child)
 
       if (!processOwner) {
@@ -7294,6 +7305,7 @@ async function startHermes(activeLease: (() => void) | null = null) {
           !child.killed,
         rememberLog
       })
+
       assertPrimaryStartupCurrent()
       backendReady = true
       backendStartFailure = null
@@ -7780,6 +7792,7 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -7790,6 +7803,7 @@ ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(pro
 // self-heal via their child 'exit' handler, so we never touch them here.
 async function revalidateDesktopConnection(activeLease: () => void) {
   const connectionPromise = backendConnectionState.getPromise()
+
   if (!connectionPromise) {
     return { ok: true, rebuilt: false }
   }
@@ -7825,6 +7839,7 @@ async function revalidateDesktopConnection(activeLease: () => void) {
     return { ok: true, rebuilt: true }
   }
 }
+
 ipcMain.handle('hermes:connection:revalidate', async () =>
   gracefulDesktopRelaunch.runOperation('connection revalidate', revalidateDesktopConnection)
 )
@@ -7991,6 +8006,7 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 
   mainWindow.webContents.send('hermes:pet-overlay:control', payload)
 })
+
 async function resetDesktopBootstrap() {
   // Renderer's "Reload and retry" path. Clear the latched failure and
   // reset connection state so the next startHermes() call restarts the
@@ -8012,9 +8028,11 @@ async function resetDesktopBootstrap() {
 
   return { ok: true }
 }
+
 ipcMain.handle('hermes:bootstrap:reset', async () =>
   gracefulDesktopRelaunch.runOperation('bootstrap reset', resetDesktopBootstrap)
 )
+
 async function repairDesktopBootstrap() {
   // Forceful repair: drop the bootstrap-complete marker so the next
   // startHermes() re-runs the full installer (refreshing a broken/partial
@@ -8036,6 +8054,7 @@ async function repairDesktopBootstrap() {
 
   return { ok: true }
 }
+
 ipcMain.handle('hermes:bootstrap:repair', async () =>
   gracefulDesktopRelaunch.runOperation('bootstrap repair', repairDesktopBootstrap)
 )
@@ -8116,6 +8135,7 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
+
 async function applyDesktopConnectionConfig(payload) {
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
@@ -8137,6 +8157,7 @@ async function applyDesktopConnectionConfig(payload) {
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 }
+
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) =>
   gracefulDesktopRelaunch.runOperation('connection apply', () => applyDesktopConnectionConfig(payload))
 )
@@ -8154,6 +8175,7 @@ ipcMain.handle('hermes:pinnedSessions:set', async (_event, ids) => {
 
   return result
 })
+
 async function setDesktopProfile(name) {
   const next = writeActiveDesktopProfile(name)
 
@@ -8165,6 +8187,7 @@ async function setDesktopProfile(name) {
 
   return { profile: next }
 }
+
 ipcMain.handle('hermes:profile:set', async (_event, name) =>
   gracefulDesktopRelaunch.runOperation('profile switch', () => setDesktopProfile(name))
 )
@@ -8393,6 +8416,7 @@ async function handleHermesApiRequest(request, activeLease: (() => void) | null 
     timeoutMs
   })
 }
+
 ipcMain.handle('hermes:api', async (_event, request) => {
   if (profileNameFromDeleteRequest(request)) {
     return gracefulDesktopRelaunch.runOperation('profile delete', assertActive =>
@@ -9095,6 +9119,7 @@ async function startDesktopTerminal(event, payload: any = {}) {
 
   return { cwd, id, shell: name }
 }
+
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) =>
   gracefulDesktopRelaunch.runOperation('terminal start', () => startDesktopTerminal(event, payload))
 )

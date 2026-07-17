@@ -32,7 +32,9 @@ function clampProgress(value: number) {
   return Math.max(0, Math.min(100, Math.round(value)))
 }
 
-export function applyDesktopBootProgress(progress: DesktopBootProgress & { failureKind?: DesktopBootFailureKind | null }) {
+export function applyDesktopBootProgress(
+  progress: DesktopBootProgress & { failureKind?: DesktopBootFailureKind | null }
+) {
   const current = $desktopBoot.get()
   const nextProgress = clampProgress(progress.progress)
   const mergedProgress = progress.running ? Math.max(current.progress, nextProgress) : nextProgress

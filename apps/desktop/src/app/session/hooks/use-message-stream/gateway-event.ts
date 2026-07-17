@@ -516,7 +516,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setClarifyRequest({
             requestId,
             question,
-            choices: Array.isArray(payload?.choices) ? payload!.choices!.filter((c): c is string => typeof c === 'string') : null,
+            choices: Array.isArray(payload?.choices)
+              ? payload!.choices!.filter((c): c is string => typeof c === 'string')
+              : null,
             sessionId: sessionId ?? null,
             multiSelect: clarifyPayload?.multi_select === true || clarifyPayload?.multiSelect === true,
             minSelections: typeof clarifyPayload?.min_selections === 'number' ? clarifyPayload.min_selections : null,

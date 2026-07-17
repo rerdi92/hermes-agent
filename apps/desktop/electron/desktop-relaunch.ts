@@ -115,9 +115,7 @@ interface DesktopOwnedStartupOptions<K, T, E extends DesktopOwnedStartupEntry<T>
   start: (entry: E, assertCurrent: () => void) => Promise<T>
 }
 
-export function decideDesktopRelaunchPreflight(
-  state: DesktopRelaunchPreflightState
-): RelaunchPreflightResult {
+export function decideDesktopRelaunchPreflight(state: DesktopRelaunchPreflightState): RelaunchPreflightResult {
   if (state.bootstrapActive) {
     return { ok: false, reason: 'bootstrap-active' }
   }
@@ -179,12 +177,7 @@ export function createDesktopRelaunchLifecycle(
     operationCount += 1
 
     const assertActive = () => {
-      if (
-        handoffActive() ||
-        (!allowRelaunchPending && relaunchPending()) ||
-        phase !== 'idle' ||
-        operationCount !== 1
-      ) {
+      if (handoffActive() || (!allowRelaunchPending && relaunchPending()) || phase !== 'idle' || operationCount !== 1) {
         throw new Error(`Hermes Desktop lifecycle lease expired; ${operation} is blocked.`)
       }
     }
@@ -411,10 +404,7 @@ export async function requestRelaunchWithRecovery(
 ): Promise<RelaunchResult> {
   const result = await lifecycle.request()
 
-  if (
-    !result.ok &&
-    (result.reason === 'relaunch-failed' || result.reason === 'quit-failed-after-relaunch')
-  ) {
+  if (!result.ok && (result.reason === 'relaunch-failed' || result.reason === 'quit-failed-after-relaunch')) {
     await lifecycle.runRecoveryOperation('primary backend recovery', recover)
   }
 

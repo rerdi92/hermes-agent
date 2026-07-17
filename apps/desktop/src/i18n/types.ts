@@ -130,8 +130,8 @@ export interface Translations {
       description: string
       remoteTitle: string
       remoteDescription: string
-      connectionLostTitle: string,
-      connectionLostDescription: string,
+      connectionLostTitle: string
+      connectionLostDescription: string
       retry: string
       repairInstall: string
       useLocalGateway: string
@@ -139,7 +139,7 @@ export interface Translations {
       back: string
       openLogs: string
       repairHint: string
-      connectionLostHint: string,
+      connectionLostHint: string
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
@@ -1800,12 +1800,12 @@ export interface Translations {
       openContextUsage: string
       session: string
       runtimeSessionElapsed: string
-      agentFleetOn: string,
-      agentFleetOff: string,
-      ultraworkOn: string,
-      ultraworkOff: string,
-      ultraresearchOn: string,
-      ultraresearchOff: string,
+      agentFleetOn: string
+      agentFleetOff: string
+      ultraworkOn: string
+      ultraworkOff: string
+      ultraresearchOn: string
+      ultraresearchOff: string
       yoloOn: string
       yoloOff: string
       modelNone: string
@@ -2041,19 +2041,19 @@ export interface Translations {
       notReady: string
       gatewayDisconnected: string
       sendFailed: string
-      responsePendingTitle: string,
-      responsePendingMessage: string,
-      responseExpiredTitle: string,
-      responseExpiredMessage: string,
+      responsePendingTitle: string
+      responsePendingMessage: string
+      responseExpiredTitle: string
+      responseExpiredMessage: string
       loadingQuestion: string
       other: string
       placeholder: string
       skip: string
       skipped: string
-      selected: string,
-      selectedCount: (count: number) => string,
-      multiSelectHint: string,
-      selectSelected: string,
+      selected: string
+      selectedCount: (count: number) => string
+      multiSelectHint: string
+      selectSelected: string
       continueLabel: string
     }
     tool: {
@@ -2125,7 +2125,7 @@ export interface Translations {
     sessionUnavailable: string
     createSessionFailed: string
     promptFailed: string
-    promptSubmitTimedOut: string,
+    promptSubmitTimedOut: string
     providerCredentialRequired: string
     emptySlashCommand: string
     desktopCommands: string
