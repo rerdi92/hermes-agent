@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "candidate_commits": [
+    "2349790979fb30c19d0a8d3563d542793bce4e94",
+    "99f7cfd225c686b06e7e8a7cfefe76cbbee697ed",
+    "10721ecfac3f787ef16c8ba1be246967c9a773d8",
+    "3e37493109f7e4aa06838b3bf5129c64158a8569",
+    "8ddf6055471000c5bea209d70a5df0c9b25a6694",
+    "371e350f4fc416ab11ab4a5e87a1613b894529a8"
+  ],
+  "manual_port_commits": [],
+  "candidate_patches": [],
+  "policy_tests": [
+    "wave1-verification",
+    "worktree-quarantine",
+    "runtime-contract"
+  ],
+  "allowed_target_paths": [
+    ".github/merge-coverage.json",
+    "tests/agent/test_codex_app_server_persist.py"
+  ]
+}

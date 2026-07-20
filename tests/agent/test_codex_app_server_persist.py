@@ -28,7 +28,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.codex_runtime import run_codex_app_server_turn
+from agent.codex_runtime import (
+    _codex_app_server_config_overrides,
+    run_codex_app_server_turn,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -46,11 +49,22 @@ def _make_turn():
     )
 
 
+def _seed_codex_session(agent):
+    """Install a reusable app-server double with its launch contract."""
+    session = MagicMock()
+    session._hermes_override_key = tuple(
+        _codex_app_server_config_overrides(agent)
+    )
+    session.run_turn.return_value = _make_turn()
+    agent._codex_session = session
+
+
 def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
-    agent._codex_session = MagicMock()
-    agent._codex_session.run_turn.return_value = _make_turn()
+    agent.model = ""
+    agent.reasoning_config = None
+    _seed_codex_session(agent)
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -82,6 +96,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -98,8 +113,7 @@ def test_codex_turn_persists_each_message_exactly_once():
             session_id=sid,
         )
         agent._session_db_created = True
-        agent._codex_session = MagicMock()
-        agent._codex_session.run_turn.return_value = _make_turn()
+        _seed_codex_session(agent)
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start
@@ -130,6 +144,8 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        if db is not None:
+            db.close()
         shutil.rmtree(tmp)
 
 

@@ -870,19 +870,19 @@ class TestSystemPromptInjection:
         assert "commit and push" in wt_note
 
 
-class TestWorktreeLockReaping:
-    """Exercise the REAL cli._prune_stale_worktrees lock/dirty/unpushed logic.
+class TestWorktreeLockQuarantine:
+    """Exercise the REAL recovery-first stale-worktree policy.
 
     Unlike the reimplementation-based tests above, these import the actual
     production functions so the behavior contract is enforced against the
     shipped code:
 
-    - live-locked (owning pid running)  -> never reaped, any age
-    - dead-locked clean (owning pid gone) -> unlocked + reaped (fixes the
-      accumulation bug: `git worktree remove --force` refuses a locked tree)
+    - live-locked (owning pid running)  -> never moved, any age
+    - dead-locked clean (owning pid gone) -> unlocked + quarantined
     - dirty (uncommitted) at any stale age -> preserved
     - unpushed commits at any age        -> preserved
-    - clean/unlocked stale               -> reaped (aggressive cleanup intact)
+    - clean/unlocked stale               -> quarantined with branch and archive
+      ref retained
     """
 
     @staticmethod
@@ -910,14 +910,14 @@ class TestWorktreeLockReaping:
             subprocess.run(["git", "commit", "-m", "wip"], cwd=p, capture_output=True)
         if dirty:
             (p / "dirty.txt").write_text("uncommitted")
-        TestWorktreeLockReaping._age(p, age_h)
+        TestWorktreeLockQuarantine._age(p, age_h)
         return p
 
     def test_live_locked_survives_at_any_age(self, git_repo):
         import cli
         wt = self._mk(cli, git_repo, "hermes-live", pid=os.getpid())
         cli._prune_stale_worktrees(str(git_repo))
-        assert wt.exists(), "live-locked worktree (this pid) must never be reaped"
+        assert wt.exists(), "live-locked worktree (this pid) must never be moved"
 
     def test_foreign_locked_survives_as_unknown(self, git_repo):
         import cli
@@ -938,13 +938,32 @@ class TestWorktreeLockReaping:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "foreign/unknown locks must never be unlocked or reaped"
 
-    def test_dead_locked_clean_is_reaped(self, git_repo):
+    def test_dead_locked_clean_is_quarantined(self, git_repo):
         import cli
         wt = self._mk(cli, git_repo, "hermes-dead", pid=999999)
-        # sanity: this is the accumulation bug — remove --force alone can't do it
+        # A crashed Hermes lock is distinct from an unknown foreign lock.
         assert cli._worktree_lock_is_live(str(git_repo), str(wt)) == "dead"
         cli._prune_stale_worktrees(str(git_repo))
-        assert not wt.exists(), "dead-locked clean worktree should be unlocked + reaped"
+        archive = git_repo / ".worktrees" / ".archive" / wt.name
+        assert not wt.exists() and archive.exists()
+        branch = f"hermes/{wt.name}"
+        assert subprocess.run(
+            ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
+            cwd=git_repo,
+            capture_output=True,
+        ).returncode == 0
+        oid = subprocess.run(
+            ["git", "rev-parse", f"refs/heads/{branch}"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert subprocess.run(
+            ["git", "show-ref", "--verify", f"refs/hermes/archive/{branch}/{oid}"],
+            cwd=git_repo,
+            capture_output=True,
+        ).returncode == 0
 
     def test_dead_locked_dirty_survives(self, git_repo):
         import cli
@@ -958,11 +977,25 @@ class TestWorktreeLockReaping:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "dead-locked worktree with unpushed commits must survive"
 
-    def test_unlocked_clean_stale_is_reaped(self, git_repo):
+    def test_unlocked_clean_stale_is_quarantined(self, git_repo):
         import cli
         wt = self._mk(cli, git_repo, "hermes-nolock", pid=None)
         cli._prune_stale_worktrees(str(git_repo))
-        assert not wt.exists(), "clean unlocked stale worktree should be reaped"
+        archive = git_repo / ".worktrees" / ".archive" / wt.name
+        assert not wt.exists() and archive.exists()
+        branch = f"hermes/{wt.name}"
+        oid = subprocess.run(
+            ["git", "rev-parse", f"refs/heads/{branch}"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert subprocess.run(
+            ["git", "show-ref", "--verify", f"refs/hermes/archive/{branch}/{oid}"],
+            cwd=git_repo,
+            capture_output=True,
+        ).returncode == 0
 
     def test_dirty_survives_over_72h(self, git_repo):
         import cli
