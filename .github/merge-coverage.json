@@ -16,6 +16,7 @@
     "runtime-contract"
   ],
   "allowed_target_paths": [
-    ".github/merge-coverage.json"
+    ".github/merge-coverage.json",
+    "tests/agent/test_codex_app_server_persist.py"
   ]
 }
